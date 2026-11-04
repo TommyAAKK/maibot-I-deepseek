@@ -1,0 +1,31 @@
+# ── 运行产物 ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+data/
+logs/
+config_back/
+*.db
+*.db-wal
+*.db-shm
+*.db.bak-*
+*.db.bak.*
+
+# ── 本地配置 ──────────────────────────────────────────────
+# 仓库里只放 config.example.toml。config.toml 里是使用者自己的开关，
+# 而且插件市场规范明确不允许仓库根目录出现它（宿主首次加载会自动生成）。
+config.toml
+*.toml.bak-*
+webui.json.bak-*
+
+# ── 一次性调试脚本（本机路径 / 临时探针，不对外发布）─────────
+cdp_*.js
+check_replyer_prompt.py
+clear_stale.py
+collect_evidence.py
+db_*_probe.py
+db_snapshot.py
+dump_extract_prompt.py
+dump_prompt.py
+mood_probe.py
+recent_probe.py
+verify_inject.py

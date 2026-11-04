@@ -1,0 +1,490 @@
+{
+  "schema_version": 2,
+  "required_capabilities": ["custom_pages", "structured_arguments"],
+  "workspace_title": "我，deepseek",
+  "pages": [
+    {
+      "id": "memories",
+      "title": "我，deepseek",
+      "description": "查看 Bot 此刻的情绪、它认识的人，以及它记住的情境记忆。所有改动直接写本地 SQLite，立即生效。",
+      "placement": "sidebar",
+      "icon": "database",
+      "mode": "custom",
+      "entry": "webui_page.html",
+      "layout": "document",
+      "queries": {
+        "stats": {
+          "api": "mem_stats",
+          "version": "1"
+        },
+        "sessions": {
+          "api": "mem_sessions",
+          "version": "1"
+        },
+        "items": {
+          "api": "mem_items",
+          "version": "1",
+          "parameters": {
+            "session_id": {
+              "type": "string",
+              "required": false,
+              "max_length": 200
+            },
+            "status": {
+              "type": "string",
+              "required": false,
+              "max_length": 32,
+              "choices": ["", "active", "resolved", "expired"]
+            },
+            "category": {
+              "type": "string",
+              "required": false,
+              "max_length": 32,
+              "choices": ["", "open_loop", "emotion", "relationship", "self", "creative"]
+            },
+            "search": {
+              "type": "string",
+              "required": false,
+              "max_length": 200
+            },
+            "limit": {
+              "type": "integer",
+              "required": false,
+              "minimum": 1,
+              "maximum": 200
+            },
+            "offset": {
+              "type": "integer",
+              "required": false,
+              "minimum": 0
+            }
+          }
+        },
+        "mood": {
+          "api": "mem_mood",
+          "version": "1"
+        },
+        "mood_history": {
+          "api": "mem_mood_history",
+          "version": "1",
+          "parameters": {
+            "limit": {
+              "type": "integer",
+              "required": false,
+              "minimum": 1,
+              "maximum": 500
+            }
+          }
+        },
+        "people": {
+          "api": "mem_people",
+          "version": "1",
+          "parameters": {
+            "limit": {
+              "type": "integer",
+              "required": false,
+              "minimum": 1,
+              "maximum": 500
+            }
+          }
+        },
+        "prefs": {
+          "api": "mem_prefs",
+          "version": "1",
+          "parameters": {
+            "limit": {
+              "type": "integer",
+              "required": false,
+              "minimum": 1,
+              "maximum": 500
+            }
+          }
+        }
+      },
+      "actions": {
+        "update": {
+          "api": "mem_update",
+          "version": "1",
+          "parameters": {
+            "item_id": {
+              "type": "integer",
+              "required": true,
+              "minimum": 1
+            },
+            "content": {
+              "type": "string",
+              "required": false,
+              "max_length": 4000
+            },
+            "category": {
+              "type": "string",
+              "required": false,
+              "max_length": 32,
+              "choices": ["", "open_loop", "emotion", "relationship", "self", "creative"]
+            },
+            "salience": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            },
+            "status": {
+              "type": "string",
+              "required": false,
+              "max_length": 32,
+              "choices": ["", "active", "resolved", "expired", "forgotten"]
+            },
+            "pinned": {
+              "type": "boolean",
+              "required": false
+            },
+            "truth_score": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        },
+        "pin": {
+          "api": "mem_pin",
+          "version": "1",
+          "parameters": {
+            "item_id": {
+              "type": "integer",
+              "required": true,
+              "minimum": 1
+            },
+            "pinned": {
+              "type": "boolean",
+              "required": false
+            }
+          }
+        },
+        "recall": {
+          "api": "mem_recall",
+          "version": "1",
+          "parameters": {
+            "item_id": {
+              "type": "integer",
+              "required": true,
+              "minimum": 1
+            }
+          }
+        },
+        "create": {
+          "api": "mem_create",
+          "version": "1",
+          "parameters": {
+            "session_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 200
+            },
+            "category": {
+              "type": "string",
+              "required": true,
+              "max_length": 32,
+              "choices": ["open_loop", "emotion", "relationship", "self", "creative"]
+            },
+            "content": {
+              "type": "string",
+              "required": true,
+              "max_length": 4000
+            },
+            "salience": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        },
+        "delete": {
+          "api": "mem_delete",
+          "version": "1",
+          "confirmation": "确认永久删除这条记忆？删除后无法恢复。",
+          "parameters": {
+            "item_id": {
+              "type": "integer",
+              "required": true,
+              "minimum": 1
+            }
+          }
+        },
+        "purge": {
+          "api": "mem_purge_session",
+          "version": "1",
+          "confirmation": "确认清空该会话的全部记忆？此操作不可恢复。",
+          "parameters": {
+            "session_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 200
+            }
+          }
+        },
+        "mood_set": {
+          "api": "mem_mood_set",
+          "version": "1",
+          "parameters": {
+            "valence": {
+              "type": "number",
+              "required": false,
+              "minimum": -1,
+              "maximum": 1
+            },
+            "arousal": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            },
+            "energy": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            },
+            "joy": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            },
+            "anger": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            },
+            "anxiety": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            },
+            "sadness": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            },
+            "interest": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            },
+            "calm": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            },
+            "disgust": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            },
+            "surprise": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            },
+            "label": {
+              "type": "string",
+              "required": false,
+              "max_length": 32
+            },
+            "reason": {
+              "type": "string",
+              "required": false,
+              "max_length": 120
+            }
+          }
+        },
+        "mood_reset": {
+          "api": "mem_mood_reset",
+          "version": "1",
+          "confirmation": "确认把 Bot 的情绪恢复到基线？"
+        },
+        "person_update": {
+          "api": "mem_person_update",
+          "version": "1",
+          "parameters": {
+            "person_key": {
+              "type": "string",
+              "required": true,
+              "max_length": 200
+            },
+            "relation_role": {
+              "type": "string",
+              "required": false,
+              "max_length": 32
+            },
+            "affection": {
+              "type": "number",
+              "required": false,
+              "minimum": -100,
+              "maximum": 100
+            },
+            "axes": {
+              "type": "object",
+              "required": false,
+              "properties": {
+                "trust": { "type": "number", "required": false, "minimum": 0, "maximum": 1 },
+                "closeness": { "type": "number", "required": false, "minimum": 0, "maximum": 1 },
+                "respect": { "type": "number", "required": false, "minimum": 0, "maximum": 1 },
+                "tension": { "type": "number", "required": false, "minimum": 0, "maximum": 1 },
+                "familiarity": { "type": "number", "required": false, "minimum": 0, "maximum": 1 },
+                "perceived_warmth": { "type": "number", "required": false, "minimum": 0, "maximum": 1 }
+              }
+            },
+            "tags": {
+              "type": "array",
+              "required": false,
+              "max_items": 5,
+              "items": {
+                "type": "string",
+                "max_length": 12
+              }
+            },
+            "display_name": {
+              "type": "string",
+              "required": false,
+              "max_length": 32
+            },
+            "follow_chat": {
+              "type": "boolean",
+              "required": false
+            }
+          }
+        },
+        "person_create": {
+          "api": "mem_person_create",
+          "version": "1",
+          "parameters": {
+            "user_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 128
+            },
+            "display_name": {
+              "type": "string",
+              "required": false,
+              "max_length": 32
+            },
+            "platform": {
+              "type": "string",
+              "required": false,
+              "max_length": 32
+            },
+            "relation_role": {
+              "type": "string",
+              "required": false,
+              "max_length": 32
+            },
+            "affection": {
+              "type": "number",
+              "required": false,
+              "minimum": -100,
+              "maximum": 100
+            },
+            "axes": {
+              "type": "object",
+              "required": false,
+              "properties": {
+                "trust": { "type": "number", "required": false, "minimum": 0, "maximum": 1 },
+                "closeness": { "type": "number", "required": false, "minimum": 0, "maximum": 1 },
+                "respect": { "type": "number", "required": false, "minimum": 0, "maximum": 1 },
+                "tension": { "type": "number", "required": false, "minimum": 0, "maximum": 1 },
+                "familiarity": { "type": "number", "required": false, "minimum": 0, "maximum": 1 },
+                "perceived_warmth": { "type": "number", "required": false, "minimum": 0, "maximum": 1 }
+              }
+            },
+            "tags": {
+              "type": "array",
+              "required": false,
+              "max_items": 5,
+              "items": {
+                "type": "string",
+                "max_length": 12
+              }
+            }
+          }
+        },
+        "person_delete": {
+          "api": "mem_person_delete",
+          "version": "1",
+          "confirmation": "确认忘掉这个人？他/她的关系与标签都会被删除。",
+          "parameters": {
+            "person_key": {
+              "type": "string",
+              "required": true,
+              "max_length": 200
+            }
+          }
+        },
+        "pref_create": {
+          "api": "mem_pref_create",
+          "version": "1",
+          "parameters": {
+            "kind": {
+              "type": "string",
+              "required": true,
+              "choices": ["like", "dislike"]
+            },
+            "topic": {
+              "type": "string",
+              "required": true,
+              "max_length": 24
+            },
+            "strength": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        },
+        "pref_update": {
+          "api": "mem_pref_update",
+          "version": "1",
+          "parameters": {
+            "pref_key": {
+              "type": "string",
+              "required": true,
+              "max_length": 200
+            },
+            "strength": {
+              "type": "number",
+              "required": false,
+              "minimum": 0,
+              "maximum": 1
+            },
+            "topic": {
+              "type": "string",
+              "required": false,
+              "max_length": 24
+            }
+          }
+        },
+        "pref_delete": {
+          "api": "mem_pref_delete",
+          "version": "1",
+          "confirmation": "确认删掉这条喜好？删掉后她就真的没这个口味了。",
+          "parameters": {
+            "pref_key": {
+              "type": "string",
+              "required": true,
+              "max_length": 200
+            }
+          }
+        }
+      }
+    }
+  ]
+}

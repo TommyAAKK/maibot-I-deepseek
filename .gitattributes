@@ -1,0 +1,11 @@
+# 统一用 LF，避免 Windows 上检出后整文件显示为「已修改」。
+* text=auto eol=lf
+
+# 二进制产物不要做任何换行转换（正常情况下已被 .gitignore 排除，
+# 万一被手动加入也不能让 git 碰它）。
+*.db binary
+*.db-wal binary
+*.db-shm binary
+*.png binary
+*.jpg binary
+*.ico binary

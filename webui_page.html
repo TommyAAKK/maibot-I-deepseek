@@ -1,0 +1,2546 @@
+<!--
+  我，deepseek —— 记忆管理自定义页面
+
+  宿主用 customPageDocument(html, nonce) 把本文件的**全部内容**塞进 <body>：
+      <body>{本文件}</body>
+  所以这里不能写 <html>/<head>/<body> 标签，样式与脚本都必须内联在片段里。
+  CSP 为 default-src 'none'，只允许内联 script/style，不能加载任何外部资源。
+
+  与插件通信只走 window.maibot：
+      await window.maibot.ready
+      window.maibot.query('items', {...})   // 对应 webui.json 的 queries
+      window.maibot.action('update', {...}) // 对应 webui.json 的 actions
+  每次调用返回插件 @API 方法的返回值（即 {"ok": true/false, ...} 这个 dict）。
+-->
+<style>
+  /* 主题完全跟随宿主：宿主把当前外观采样成 CSS 变量注入 iframe
+     （--maibot-background / surface / foreground / muted / soft / border /
+       primary / primary-foreground / danger / radius / font-body），
+     这里只做「优先用宿主变量，缺失时用兜底值」的映射。
+     兜底值取自 MaiBot 默认主题（橙色 primary），所以离线预览和宿主没注入时
+     也不会退回 GitHub 蓝。注意：深色兜底只改兜底常量（--cg-fb-*），
+     不能直接改 --cg-* —— 否则会把宿主注入的深色变量盖掉。 */
+  .cg-root {
+    --cg-fb-bg: #ffffff;
+    --cg-fb-surface: #fbfcfc;
+    --cg-fb-soft: #f4f6f6;
+    --cg-fb-fg: #020817;
+    --cg-fb-muted: #608990;
+    --cg-fb-border: #e5eced;
+    --cg-fb-primary: #e06f06;
+    --cg-fb-primary-fg: #f8fafc;
+    --cg-fb-danger: #d31212;
+    --cg-fb-radius: 8px;
+    --cg-bg: var(--maibot-background, var(--cg-fb-bg));
+    --cg-surface: var(--maibot-surface, var(--cg-fb-surface));
+    --cg-soft: var(--maibot-soft, var(--cg-fb-soft));
+    --cg-fg: var(--maibot-foreground, var(--cg-fb-fg));
+    --cg-muted: var(--maibot-muted, var(--cg-fb-muted));
+    --cg-border: var(--maibot-border, var(--cg-fb-border));
+    --cg-accent: var(--maibot-primary, var(--cg-fb-primary));
+    --cg-accent-fg: var(--maibot-primary-foreground, var(--cg-fb-primary-fg));
+    --cg-danger: var(--maibot-danger, var(--cg-fb-danger));
+    --cg-radius: var(--maibot-radius, var(--cg-fb-radius));
+    /* 面板底色不能直接写 background: var(--cg-surface)。
+       宿主的 --maibot-surface 采样自卡片背景色，而 future-retro 主题把卡片
+       改成 `background-color: transparent !important`，于是 --cg-surface 就是
+       transparent —— 直接用它会让弹窗、卡片、工具栏全部透明，底下的内容透出来。
+       这里改成「先铺一层一定不透明的 --cg-bg，再把 surface 当渐变盖上去」：
+       surface 是实色时覆盖掉底色，是 transparent 时什么也不画、露出底色。
+       两种主题下都正确，且不需要 JS 检测颜色透明度。 */
+    --cg-panel-image: linear-gradient(var(--cg-surface), var(--cg-surface));
+    /* 「纸面」底色。宿主外壳和对话框都不是直接铺 --retro-paper，而是在它上面
+       再叠一层 --retro-paper-brightness-overlay（rgb(255 252 242 / 0.24)，
+       见 dashboard/src/index.css:594-597、:646-653、:1394-1406）。
+       不叠这一层页面就比宿主外壳暗一档 —— 用户反馈的「颜色深一点点」正是这个。
+       默认等于 --cg-bg，只有 future-retro 浅色下才换成叠过层的值。 */
+    --cg-bg-shell: var(--cg-bg);
+    --cg-shadow: 0 12px 40px rgba(0, 0, 0, .3);
+    --cg-shadow-sm: 0 6px 24px rgba(0, 0, 0, .3);
+    --cg-badge-radius: 999px;
+    --cg-stroke-width: 1px;
+    --cg-ok: #1a7f37;
+    --cg-warn: #9a6700;
+    --cg-cat-open_loop: #2f6feb;
+    --cg-cat-emotion: #d6409f;
+    --cg-cat-relationship: #8250df;
+    --cg-cat-self: #1a7f37;
+    --cg-cat-creative: #b8770a;
+    box-sizing: border-box;
+    width: 100%;
+    padding: 4px 2px 24px;
+    /* 只设 background-color，不写 background 简写：宿主的 .maibot-page 会铺纸纹
+       （background-image），简写会把那层纹理清掉。 */
+    background-color: var(--cg-bg-shell);
+    color: var(--cg-fg);
+    font: 14px/1.55 var(--maibot-font-body, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif);
+    -webkit-font-smoothing: antialiased;
+  }
+  html.dark .cg-root {
+    --cg-fb-bg: #020817;
+    --cg-fb-surface: #042429;
+    --cg-fb-soft: #273032;
+    --cg-fb-fg: #f8fafc;
+    --cg-fb-muted: #94b3b6;
+    --cg-fb-border: #243336;
+    --cg-fb-primary: #e06f06;
+    --cg-fb-primary-fg: #f8fafc;
+    --cg-fb-danger: #7f1d1d;
+    --cg-ok: #56d364;
+    --cg-warn: #e3b341;
+    --cg-cat-open_loop: #6cb6ff;
+    --cg-cat-emotion: #f778ba;
+    --cg-cat-relationship: #c297ff;
+    --cg-cat-self: #56d364;
+    --cg-cat-creative: #e3b341;
+  }
+  .cg-root * { box-sizing: border-box; }
+  /* 根节点同时带宿主的 .maibot-page 类（用它继承纸纹与字体）。但宿主的
+     context.styles 是追加到 body 末尾的，`.maibot-page{background-color:var(--maibot-background)}`
+     与 `.cg-root{...}` 特异性相同（都是 0,1,0）却排在后面，于是宿主的
+     --retro-paper 原色盖掉我们算好的提亮值 —— 页面就比宿主外壳暗一档。
+     用 .cg-root.maibot-page（0,2,0）提一级，只改颜色，保留宿主那层纸纹。 */
+  .cg-root.maibot-page {
+    background-color: var(--cg-bg-shell);
+  }
+  /* 宿主页面本身已有 h1 标题栏与 p-4 内边距，这里不再重复画标题，
+     只保留一行说明文字，避免「页面里套页面」的观感。 */
+  .cg-root h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: .1px; }
+  .cg-root p { margin: 0; }
+
+  /* ── 面板底色：两层画法 ──
+     第一层是 --cg-bg（一定不透明），第二层是 --cg-surface 渐变。
+     surface 是实色时它盖住底色；surface 是 transparent 时这一层什么也不画，
+     于是露出不透明的底色 —— 不会出现「背景透明、底下内容透出来」。 */
+
+  .cg-head { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; }
+  .cg-sub { margin-top: 4px !important; color: var(--cg-muted); font-size: 12.5px; max-width: 62ch; }
+  .cg-head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .cg-btn {
+    appearance: none; border: var(--cg-stroke-width) solid var(--cg-border); color: var(--cg-fg);
+    background-color: var(--cg-bg); background-image: var(--cg-panel-image);
+    padding: 7px 14px; border-radius: var(--cg-radius); font-size: 13px; cursor: pointer; line-height: 1.4;
+    font-family: inherit; transition: background .12s, border-color .12s, opacity .12s, filter .12s;
+  }
+  .cg-btn:hover:not(:disabled) { background-color: var(--cg-soft); background-image: none; }
+  .cg-btn:disabled { opacity: .5; cursor: not-allowed; }
+  .cg-btn:focus-visible { outline: 2px solid var(--cg-accent); outline-offset: 2px; }
+  .cg-btn.primary { background-color: var(--cg-accent); background-image: none; border-color: var(--cg-accent); color: var(--cg-accent-fg); font-weight: 500; }
+  .cg-btn.primary:hover:not(:disabled) { background-color: var(--cg-accent); filter: brightness(1.08); }
+  .cg-btn.danger { color: var(--cg-danger); border-color: var(--cg-danger); background-color: transparent; background-image: none; }
+  .cg-btn.danger:hover:not(:disabled) { background-color: color-mix(in srgb, var(--cg-danger) 12%, transparent); background-image: none; }
+  .cg-btn.sm { padding: 4px 10px; font-size: 12px; }
+
+  /* 统计行现在住在「记忆」面板内部（用户要求：它描述的是记忆，不该单独浮在外面），
+     所以不需要 margin-top：面板本身已经有 padding。 */
+  .cg-stats { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 0; margin-bottom: 10px; }
+  .cg-chip {
+    border: var(--cg-stroke-width) solid var(--cg-border); border-radius: var(--cg-badge-radius);
+    background-color: var(--cg-bg); background-image: var(--cg-panel-image);
+    padding: 4px 12px; font-size: 12.5px; color: var(--cg-muted); white-space: nowrap;
+  }
+  .cg-chip b { color: var(--cg-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* ── 模块外壳：情绪 / 认识的人 / 记忆 三块用同一套外观 ──
+     之前情绪和人物各自画了带边框的面板、记忆那块却没有，看起来像两个插件拼的。
+     现在统一成「标题行 + 内容」的同一个壳：边框、圆角、底色、内边距全部共用，
+     记忆模块也套上同一个 .cg-panel，三块在视觉上等重。 */
+  .cg-panel {
+    margin-top: 16px; padding: 12px 14px;
+    border: var(--cg-stroke-width) solid var(--cg-border);
+    border-radius: var(--cg-radius);
+    background-color: var(--cg-bg);
+    background-image: var(--cg-panel-image);
+  }
+  .cg-panel-head {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .cg-panel-title { font-size: 15px; font-weight: 700; color: var(--cg-fg); }
+  .cg-panel-cap { color: var(--cg-muted); font-size: 12.5px; flex: 1 1 auto; min-width: 80px; }
+  .cg-panel-act { display: flex; gap: 8px; margin-left: auto; }
+
+  /* 情绪面板 */
+  .cg-mood-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .cg-mood-label { font-size: 15px; font-weight: 700; color: var(--cg-fg); }
+  .cg-mood-reason { color: var(--cg-muted); font-size: 12.5px; flex: 1 1 auto; min-width: 120px; }
+  .cg-mood-bars { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; }
+  .cg-mood-bar { flex: 1 1 150px; min-width: 130px; }
+  /* 八个基元固定每行 4 个：flex 按宽度换行会出现「第一行 6 个第二行 2 个」，
+     用 grid 定列数才能均分。窄屏退成两列，再窄退成一列。 */
+  .cg-mood-bars.prims {
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px 14px; margin-top: 10px;
+  }
+  @media (max-width: 720px) {
+    .cg-mood-bars.prims { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 420px) {
+    .cg-mood-bars.prims { grid-template-columns: minmax(0, 1fr); }
+  }
+  .cg-mood-bars.prims .cg-mood-bar { flex: none; min-width: 0; }
+  .cg-mood-bar-head {
+    display: flex; justify-content: space-between; gap: 8px;
+    font-size: 12px; color: var(--cg-muted); margin-bottom: 4px;
+  }
+  .cg-mood-bar-head b { color: var(--cg-fg); font-variant-numeric: tabular-nums; }
+  .cg-mood-track {
+    position: relative; height: 6px; border-radius: 999px; overflow: hidden;
+    background: color-mix(in srgb, var(--cg-fg) 12%, transparent);
+  }
+  /* 基线参考线：基元值在基线上方=比平时更强烈，下方=比平时更淡。
+     没有这条线用户看不出「0.45 到底算高还是算低」。 */
+  .cg-mood-track i {
+    position: absolute; top: -1px; bottom: -1px; width: 2px; margin-left: -1px;
+    background: color-mix(in srgb, var(--cg-fg) 55%, transparent);
+  }
+  .cg-mood-fill { height: 100%; border-radius: 999px; transition: width .25s; }
+  .cg-mood-fill.val { background: var(--cg-accent); }
+  .cg-mood-fill.aro { background: var(--cg-cat-emotion); }
+  .cg-mood-fill.eng { background: var(--cg-cat-self); }
+  .cg-mood-fill.joy { background: var(--cg-cat-self); }
+  .cg-mood-fill.anger { background: var(--cg-danger); }
+  .cg-mood-fill.anxiety { background: var(--cg-cat-creative); }
+  .cg-mood-fill.sadness { background: var(--cg-cat-open_loop); }
+  .cg-mood-fill.interest { background: var(--cg-cat-relationship); }
+  .cg-mood-fill.calm { background: var(--cg-cat-emotion); }
+  .cg-mood-fill.disgust { background: var(--cg-warn); }
+  .cg-mood-fill.surprise { background: var(--cg-accent); }
+  .cg-mood-group-title {
+    margin-top: 12px; font-size: 11.5px; font-weight: 600; letter-spacing: .04em;
+    color: var(--cg-muted); text-transform: none;
+  }
+  .cg-mood-guide {
+    margin-top: 10px; padding-top: 10px; font-size: 12.5px; color: var(--cg-muted);
+    border-top: var(--cg-stroke-width) dashed var(--cg-border); line-height: 1.6;
+  }
+  .cg-mood-guide b { color: var(--cg-fg); font-weight: 600; }
+  .cg-mood-effort {
+    margin-top: 6px; padding: 7px 10px; font-size: 12.5px; line-height: 1.6;
+    color: var(--cg-fg); border-radius: var(--cg-radius);
+    border: var(--cg-stroke-width) solid var(--cg-cat-emotion);
+    background: color-mix(in srgb, var(--cg-cat-emotion) 10%, transparent);
+  }
+  .cg-mood-effort.exhausted {
+    border-color: var(--cg-danger);
+    background: color-mix(in srgb, var(--cg-danger) 12%, transparent);
+  }
+  .cg-mood-effort b { font-weight: 600; }
+  /* 「回复欲望」和「回复长度」各占一行：并排会连成一长串，读不出是两件事。 */
+  .cg-mood-effort-line { display: block; margin-top: 2px; }
+  .cg-mood-empty { color: var(--cg-muted); font-size: 12.5px; }
+  .cg-mood-hist {
+    display: flex; align-items: flex-end; gap: 2px; height: 26px; margin-top: 10px;
+  }
+  .cg-mood-hist i {
+    flex: 1 1 0; min-width: 2px; border-radius: 1px 1px 0 0;
+    background: var(--cg-muted); opacity: .55;
+  }
+  .cg-mood-hist i.pos { background: var(--cg-cat-self); }
+  .cg-mood-hist i.neg { background: var(--cg-cat-emotion); }
+  .cg-mood-hist-cap { margin-top: 4px; font-size: 11.5px; color: var(--cg-muted); }
+
+  .cg-people-head {
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  }
+  .cg-people-cap { font-size: 11.5px; color: var(--cg-muted); }
+  .cg-people-empty { margin-top: 8px; color: var(--cg-muted); font-size: 12.5px; }
+  .cg-people-list { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+  .cg-person {
+    padding: 9px 11px;
+    border: var(--cg-stroke-width) solid var(--cg-border);
+    border-radius: var(--cg-radius);
+    background: color-mix(in srgb, var(--cg-fg) 3%, transparent);
+  }
+  .cg-person-top {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  }
+  .cg-person-name { font-weight: 600; font-size: 13.5px; }
+  .cg-person-id { font-size: 11px; color: var(--cg-muted); }
+  .cg-person-meta {
+    margin-top: 5px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    font-size: 11.5px; color: var(--cg-muted);
+  }
+  .cg-person-bar {
+    flex: 1 1 90px; min-width: 60px; height: 5px; border-radius: 3px;
+    background: color-mix(in srgb, var(--cg-fg) 12%, transparent);
+    overflow: hidden;
+  }
+  .cg-person-bar i {
+    display: block; height: 100%; width: 0;
+    background: var(--cg-cat-relationship);
+  }
+  .cg-person-notes { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .cg-person-note-cap { font-size: 11px; color: var(--cg-muted); }
+  .cg-person-note {
+    font-size: 11.5px; padding: 1px 7px; border-radius: 9px;
+    background: color-mix(in srgb, var(--cg-fg) 8%, transparent);
+  }
+  .cg-person-act { margin-left: auto; display: flex; gap: 6px; }
+  /* 关系六维：卡片上的小六边形示意 + 弹窗里的滑杆。
+     六条细条比六个数字好扫——一眼就能看出哪一维离基线最远。 */
+  .cg-axes-mini {
+    margin-top: 7px; display: grid; grid-template-columns: repeat(3, 1fr);
+    gap: 4px 10px;
+  }
+  .cg-axis-mini { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--cg-muted); }
+  .cg-axis-mini span { flex: 0 0 auto; }
+  .cg-axis-mini b {
+    flex: 1 1 auto; height: 4px; border-radius: 2px; position: relative;
+    background: color-mix(in srgb, var(--cg-fg) 12%, transparent); overflow: hidden;
+  }
+  .cg-axis-mini b i { display: block; height: 100%; width: 0; background: var(--cg-accent); }
+  .cg-axis-mini.hot b i { background: var(--cg-cat-emotion); }
+  /* 矛盾描述：整个面板信息量最大的一行，用引号包起来当「心里话」显示。 */
+  .cg-person-voice {
+    margin-top: 6px; padding: 5px 9px; border-radius: 7px; font-size: 12px;
+    background: color-mix(in srgb, var(--cg-accent) 9%, transparent);
+    border-left: 2px solid var(--cg-accent);
+  }
+  .cg-axis-grid { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+  .cg-axis-row { display: flex; align-items: center; gap: 9px; }
+  .cg-axis-row label { flex: 0 0 76px; font-size: 12px; color: var(--cg-fg); }
+  .cg-axis-row input[type="range"] { flex: 1 1 auto; }
+  .cg-axis-row .cg-range-val { flex: 0 0 34px; text-align: right; }
+  .cg-axis-row .cg-axis-hint { flex: 1 1 100%; font-size: 11px; color: var(--cg-muted); margin: -4px 0 0 85px; }
+  /* 喜好面板：和「认识的人」并列，但内容是「关于她自己」的。
+     喜欢用暖色、讨厌用冷色，扫一眼就能分出两堆。 */
+  .cg-prefs-empty { margin-top: 8px; color: var(--cg-muted); font-size: 12.5px; }
+  .cg-prefs-list { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+  .cg-pref {
+    display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+    padding: 7px 10px;
+    border: var(--cg-stroke-width) solid var(--cg-border);
+    border-radius: var(--cg-radius);
+    background: color-mix(in srgb, var(--cg-fg) 3%, transparent);
+  }
+  .cg-pref-topic { font-size: 13px; font-weight: 600; }
+  .cg-pref-bar {
+    flex: 1 1 90px; min-width: 60px; height: 5px; border-radius: 3px;
+    background: color-mix(in srgb, var(--cg-fg) 12%, transparent);
+    overflow: hidden;
+  }
+  .cg-pref-bar i { display: block; height: 100%; width: 0; }
+  .cg-pref.like .cg-pref-bar i { background: var(--cg-cat-emotion); }
+  .cg-pref.dislike .cg-pref-bar i { background: var(--cg-danger); }
+  .cg-badge.kind-like { color: var(--cg-cat-emotion); border-color: color-mix(in srgb, var(--cg-cat-emotion) 45%, transparent); }
+  .cg-badge.kind-dislike { color: var(--cg-danger); border-color: color-mix(in srgb, var(--cg-danger) 45%, transparent); }
+  .cg-pref-meta { font-size: 11.5px; color: var(--cg-muted); }
+  .cg-pref-act { margin-left: auto; display: flex; gap: 6px; }
+  .cg-prefs-tip { margin: 8px 0 0; font-size: 11.5px; color: var(--cg-muted); }
+  /* 标签编辑器：标签是「XX的XX」这种关系化说法，用户可以随时改和删。
+     之前只有「加一条备注」的输入框，加错了就删不掉，用户为此专门提过一次。 */
+  .cg-tag-list { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; min-height: 22px; }
+  .cg-tag-empty { font-size: 12px; color: var(--cg-muted); }
+  .cg-tag {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 12px; padding: 2px 4px 2px 9px; border-radius: 10px;
+    border: var(--cg-stroke-width) solid var(--cg-border);
+    background: color-mix(in srgb, var(--cg-fg) 6%, transparent);
+  }
+  .cg-tag-x {
+    border: none; background: none; color: var(--cg-muted); cursor: pointer;
+    font-size: 13px; line-height: 1; padding: 0 3px; border-radius: 6px;
+  }
+  .cg-tag-x:hover { color: var(--cg-danger); background: color-mix(in srgb, var(--cg-danger) 14%, transparent); }
+  .cg-tag-add { display: flex; gap: 6px; margin-top: 6px; }
+  .cg-tag-add input { flex: 1 1 auto; min-width: 0; }
+  .cg-form-tip { margin: 4px 0 0; font-size: 11.5px; color: var(--cg-muted); }
+  /* 手动设定过的关系要能一眼看出来，否则用户不知道自动判断还能不能改它。 */
+  .cg-badge.manual {
+    border-color: var(--cg-accent);
+    color: var(--cg-accent);
+  }
+
+  /* 记忆模块的筛选条不再自己画边框：它现在套在 .cg-panel 里，重复画会变双框。 */
+  .cg-toolbar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 0; margin-top: 0;
+  }
+  .cg-field { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--cg-muted); }
+  .cg-root select, .cg-root input[type="text"], .cg-root input[type="number"], .cg-root textarea {
+    font: inherit; font-size: 13px; color: var(--cg-fg);
+    background-color: var(--cg-bg); background-image: var(--cg-panel-image);
+    border: var(--cg-stroke-width) solid var(--cg-border); border-radius: var(--cg-radius);
+    padding: 6px 9px; outline: none;
+    transition: border-color .12s, box-shadow .12s;
+  }
+  .cg-root select:focus, .cg-root input:focus, .cg-root textarea:focus {
+    border-color: var(--cg-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--cg-accent) 20%, transparent);
+  }
+  .cg-root select { max-width: 220px; }
+  .cg-search { flex: 1 1 200px; min-width: 160px; }
+  .cg-spacer { flex: 1 1 auto; }
+
+  .cg-list { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+  .cg-item {
+    border: var(--cg-stroke-width) solid var(--cg-border); border-radius: var(--cg-radius);
+    background-color: var(--cg-bg); background-image: var(--cg-panel-image);
+    padding: 12px 14px; transition: background .12s, border-color .12s;
+  }
+  .cg-item:hover { background-color: var(--cg-soft); background-image: none; }
+  .cg-item-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .cg-id { color: var(--cg-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .cg-badge {
+    display: inline-block; padding: 1px 8px; border-radius: var(--cg-badge-radius); font-size: 11.5px;
+    border: var(--cg-stroke-width) solid var(--cg-border); color: var(--cg-muted); white-space: nowrap;
+  }
+  .cg-badge.cat-open_loop { color: var(--cg-cat-open_loop); border-color: color-mix(in srgb, var(--cg-cat-open_loop) 40%, transparent); background: color-mix(in srgb, var(--cg-cat-open_loop) 10%, transparent); }
+  .cg-badge.cat-emotion { color: var(--cg-cat-emotion); border-color: color-mix(in srgb, var(--cg-cat-emotion) 40%, transparent); background: color-mix(in srgb, var(--cg-cat-emotion) 10%, transparent); }
+  .cg-badge.cat-relationship { color: var(--cg-cat-relationship); border-color: color-mix(in srgb, var(--cg-cat-relationship) 40%, transparent); background: color-mix(in srgb, var(--cg-cat-relationship) 10%, transparent); }
+  .cg-badge.cat-self { color: var(--cg-cat-self); border-color: color-mix(in srgb, var(--cg-cat-self) 40%, transparent); background: color-mix(in srgb, var(--cg-cat-self) 10%, transparent); }
+  .cg-badge.cat-creative { color: var(--cg-cat-creative); border-color: color-mix(in srgb, var(--cg-cat-creative) 40%, transparent); background: color-mix(in srgb, var(--cg-cat-creative) 10%, transparent); }
+  .cg-badge.st-active { color: var(--cg-ok); border-color: color-mix(in srgb, var(--cg-ok) 45%, transparent); }
+  .cg-badge.st-resolved { color: var(--cg-muted); }
+  .cg-badge.st-expired { color: var(--cg-warn); border-color: color-mix(in srgb, var(--cg-warn) 45%, transparent); }
+  /* 遗忘是第 32 轮新增的状态：条目还在，只是不再主动想起来。
+     用虚线边框表示「在这儿，但碰不到」，和「已过期」的实线警告区分开。 */
+  .cg-badge.st-forgotten { color: var(--cg-muted); border-style: dashed; }
+  /* 置顶的条目标一个图钉，一眼能看出它不会被遗忘。 */
+  .cg-badge.pinned { color: var(--cg-accent); border-color: color-mix(in srgb, var(--cg-accent) 45%, transparent); }
+  /* 存疑标记：模型判断这条不太可信。不删不藏，只是提示「别当板上钉钉」。 */
+  .cg-badge.doubted { color: var(--cg-warn); border-color: color-mix(in srgb, var(--cg-warn) 45%, transparent); }
+  /* 连刷标记：这条连续多轮被注入，轮换机制正在把它往后压。 */
+  .cg-badge.streak { color: var(--cg-warn); border-color: color-mix(in srgb, var(--cg-warn) 35%, transparent); }
+  .cg-item.is-forgotten .cg-content { opacity: 0.62; }
+  .cg-sal { font-size: 11.5px; color: var(--cg-muted); font-variant-numeric: tabular-nums; }
+  .cg-content { margin-top: 6px; white-space: pre-wrap; word-break: break-word; }
+  .cg-meta { margin-top: 7px; display: flex; gap: 12px; flex-wrap: wrap; font-size: 11.5px; color: var(--cg-muted); }
+  .cg-item-actions { margin-left: auto; display: flex; gap: 6px; }
+
+  .cg-empty, .cg-loading {
+    padding: 34px 12px; text-align: center; color: var(--cg-muted); font-size: 13px;
+    border: 1px dashed var(--cg-border); border-radius: var(--cg-radius);
+  }
+  .cg-pager { display: flex; align-items: center; gap: 10px; margin-top: 14px; font-size: 12.5px; color: var(--cg-muted); }
+  .cg-pager .cg-spacer { flex: 1 1 auto; }
+
+  /* 弹窗必须落在「宿主窗口的可见区域」里，不能用 inset:0。
+     layout=document 时宿主把 iframe 高度撑成整页内容高度（几千像素），
+     iframe 内的 position:fixed 是相对这个超高 iframe 定位的，inset:0 会把
+     弹窗居中到 iframe 的垂直中点 —— 那已经在用户视野下方很远处，而
+     focus() 又会把外层页面滚过去，看起来就是「页面被下拉一大段、滚动条
+     跳到中间」。宿主在滚动/缩放时会 postMessage 更新 --maibot-viewport-top
+     与 --maibot-viewport-height，用它们把弹窗钉在真正可见的那一段里。 */
+  .cg-modal {
+    position: fixed; left: 0; right: 0;
+    top: var(--maibot-viewport-top, 0px);
+    height: var(--maibot-viewport-height, 100vh);
+    z-index: 40; display: flex; align-items: center; justify-content: center;
+    padding: 20px; background: rgba(0, 0, 0, .45);
+  }
+  .cg-modal[hidden] { display: none; }
+  .cg-modal-box {
+    width: 100%; max-width: 620px; max-height: 100%; overflow: auto;
+    /* 两层底色：先 --cg-bg（一定不透明），再盖 --cg-surface 渐变。
+       future-retro 主题下 --maibot-surface 采样到 transparent，
+       单写 background: var(--cg-surface) 会让弹窗透明、底下卡片透出来。 */
+    background-color: var(--cg-bg); background-image: var(--cg-panel-image);
+    color: var(--cg-fg); border: var(--cg-stroke-width) solid var(--cg-border);
+    border-radius: calc(var(--cg-radius) + 4px); box-shadow: var(--cg-shadow);
+    padding: 20px;
+  }
+  .cg-modal-box h2 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+  .cg-modal-hint { color: var(--cg-muted); font-size: 12px; margin-bottom: 14px !important; }
+  .cg-form { display: flex; flex-direction: column; gap: 12px; }
+  .cg-form-row { display: flex; flex-direction: column; gap: 5px; }
+  .cg-form-row > label { font-size: 12.5px; color: var(--cg-muted); }
+  .cg-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .cg-root textarea { resize: vertical; min-height: 108px; line-height: 1.5; }
+  .cg-range-row { display: flex; align-items: center; gap: 10px; }
+  .cg-root input[type="range"] { flex: 1 1 auto; accent-color: var(--cg-accent); }
+  .cg-range-val { width: 46px; text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; }
+  .cg-modal-actions { display: flex; gap: 8px; margin-top: 18px; }
+  .cg-modal-actions .cg-spacer { flex: 1 1 auto; }
+  /* 「跟随聊天」勾选行：六维手动锁定后的解除开关。 */
+  .cg-check-row { display: flex; align-items: center; gap: 7px; font-size: 12.5px; }
+  .cg-check-row input[type="checkbox"] { accent-color: var(--cg-accent); margin: 0; }
+  .cg-check-row label { color: var(--cg-text); cursor: pointer; }
+
+  /* toast 同理：fixed 的 bottom 会落到超高 iframe 的底部，必须换算到可见区域。 */
+  .cg-toast {
+    position: fixed; left: 50%; z-index: 60;
+    top: calc(var(--maibot-viewport-top, 0px) + var(--maibot-viewport-height, 100vh) - 26px);
+    transform: translate(-50%, -100%);
+    background: var(--cg-fg); color: var(--cg-bg); padding: 9px 18px;
+    border-radius: var(--cg-radius); font-size: 13px;
+    box-shadow: var(--cg-shadow-sm); max-width: min(560px, calc(100vw - 40px));
+  }
+  .cg-toast[hidden] { display: none; }
+  .cg-toast.err { background: var(--cg-danger); color: #fff; }
+  .cg-toast.ok { background: var(--cg-ok); color: #fff; }
+
+  /* ── 跟随宿主 future-retro 主题 ──
+     宿主 SDK 会把 context.dashboardStyle 写到根元素的 data-dashboard-style 属性
+     （见 dashboard/src/lib/plugin-custom-page.ts:75），所以 iframe 内也能感知风格。
+     future-retro 的视觉语言是「纸面无圆角 + 墨线描边 + 硬阴影 + 粗体」，
+     与默认的圆角卡片差别很大；这里把页面调成同一套语言，避免观感割裂。 */
+  html[data-dashboard-style='future-retro'] .cg-root {
+    --cg-radius: 0px;
+    --cg-badge-radius: 2px;
+    --cg-stroke-width: 2px;
+    --cg-shadow: 4px 4px 0 rgba(10, 69, 80, .28);
+    --cg-shadow-sm: 3px 3px 0 rgba(10, 69, 80, .28);
+    /* 对齐宿主外壳的纸面亮度。宿主是 --retro-paper 上再叠 24% 的
+       rgb(255 252 242)，等价于把纸色和这个白暖色按 76:24 混一次。
+       --cg-bg 本身就是 var(--retro-paper)，所以直接混它即可，
+       不用把宿主的色值写死在这里（换 paperWarmth 也能自动跟上）。 */
+    --cg-bg-shell: color-mix(in srgb, var(--cg-bg) 76%, rgb(255 252 242));
+    letter-spacing: 0;
+  }
+  /* 深色 retro 的 --retro-paper-brightness-overlay 是 none（index.css:619），
+     没有提亮层可叠，必须还原成原始纸色，否则会凭空发亮。 */
+  html.dark[data-dashboard-style='future-retro'] .cg-root {
+    --cg-bg-shell: var(--cg-bg);
+  }
+  html[data-dashboard-style='future-retro'] .cg-btn,
+  html[data-dashboard-style='future-retro'] .cg-chip,
+  html[data-dashboard-style='future-retro'] .cg-badge,
+  html[data-dashboard-style='future-retro'] .cg-root h2 {
+    font-weight: 700;
+  }
+  html[data-dashboard-style='future-retro'] .cg-btn:hover:not(:disabled) {
+    transform: translateY(-1px);
+  }
+  /* future-retro 的卡片是「透明底 + 墨线框」，纸色从底下透出来才是它的质感。
+     所以平面容器都改成透明，只留描边；输入框用极淡的墨色压出凹陷感。
+     .cg-root 与 .cg-modal-box 保持不透明的 --cg-bg（future-retro 下就是宿主的
+     米黄纸色），因为它们是「纸面」本身，且弹窗必须挡住底下内容。 */
+  html[data-dashboard-style='future-retro'] .cg-btn,
+  html[data-dashboard-style='future-retro'] .cg-chip,
+  html[data-dashboard-style='future-retro'] .cg-toolbar,
+  html[data-dashboard-style='future-retro'] .cg-item {
+    background-color: transparent;
+    background-image: none;
+  }
+  html[data-dashboard-style='future-retro'] .cg-btn:hover:not(:disabled),
+  html[data-dashboard-style='future-retro'] .cg-item:hover {
+    background-color: color-mix(in srgb, var(--cg-fg) 7%, transparent);
+    background-image: none;
+  }
+  html[data-dashboard-style='future-retro'] .cg-btn.primary {
+    background-color: var(--cg-accent);
+    background-image: none;
+    color: var(--cg-accent-fg);
+    box-shadow: var(--cg-shadow-sm);
+  }
+  html[data-dashboard-style='future-retro'] .cg-btn.primary:hover:not(:disabled) {
+    background-color: var(--cg-accent);
+    filter: brightness(1.08);
+  }
+  html[data-dashboard-style='future-retro'] .cg-root select,
+  html[data-dashboard-style='future-retro'] .cg-root input[type="text"],
+  html[data-dashboard-style='future-retro'] .cg-root input[type="number"],
+  html[data-dashboard-style='future-retro'] .cg-root textarea {
+    background-color: color-mix(in srgb, var(--cg-fg) 6%, transparent);
+    background-image: none;
+  }
+  html[data-dashboard-style='future-retro'] .cg-modal-box {
+    /* 宿主对话框同样铺「纸色 + 提亮层」（index.css:1399-1400），保持一致。 */
+    background-color: var(--cg-bg-shell);
+    background-image: none;
+  }
+</style>
+
+<div class="cg-root maibot-page">
+  <div class="cg-head">
+    <p class="cg-sub">看 Bot 此刻的情绪、它认识的人，以及它记住的情境记忆。改动直接写入本地数据库，下一轮回复立即生效。</p>
+    <div class="cg-head-actions">
+      <button class="cg-btn" id="cg-refresh" type="button">刷新</button>
+    </div>
+  </div>
+
+  <div class="cg-panel cg-mood" id="cg-mood">
+    <div class="cg-panel-head">
+      <span class="cg-panel-title">情绪</span>
+      <span class="cg-panel-cap" id="cg-mood-cap"></span>
+      <span class="cg-panel-act">
+        <button class="cg-btn sm" id="cg-mood-adjust" type="button">调整</button>
+        <button class="cg-btn sm" id="cg-mood-reset" type="button">回到基线</button>
+      </span>
+    </div>
+    <div class="cg-mood-empty" id="cg-mood-empty">正在读取情绪…</div>
+    <div id="cg-mood-body" hidden>
+      <div class="cg-mood-top">
+        <span class="cg-mood-label" id="cg-mood-label"></span>
+        <span class="cg-mood-reason" id="cg-mood-reason"></span>
+      </div>
+      <div class="cg-mood-group-title" id="cg-mood-prims-title">情绪基元（竖线是平时的基线，右侧数字是当前值）</div>
+      <div class="cg-mood-bars prims" id="cg-mood-prims"></div>
+      <div class="cg-mood-group-title">由基元推出的整体状态</div>
+      <div class="cg-mood-bars">
+        <div class="cg-mood-bar">
+          <div class="cg-mood-bar-head"><span>愉悦度</span><b id="cg-mood-val-txt">—</b></div>
+          <div class="cg-mood-track"><div class="cg-mood-fill val" id="cg-mood-val-bar" style="width:0%"></div></div>
+        </div>
+        <div class="cg-mood-bar">
+          <div class="cg-mood-bar-head"><span>情绪强度</span><b id="cg-mood-aro-txt">—</b></div>
+          <div class="cg-mood-track"><div class="cg-mood-fill aro" id="cg-mood-aro-bar" style="width:0%"></div></div>
+        </div>
+        <div class="cg-mood-bar">
+          <div class="cg-mood-bar-head"><span>精力</span><b id="cg-mood-eng-txt">—</b></div>
+          <div class="cg-mood-track"><div class="cg-mood-fill eng" id="cg-mood-eng-bar" style="width:0%"></div></div>
+        </div>
+      </div>
+      <div class="cg-mood-guide" id="cg-mood-guide"></div>
+      <div class="cg-mood-effort" id="cg-mood-effort" hidden></div>
+      <div class="cg-mood-hist" id="cg-mood-hist"></div>
+      <div class="cg-mood-hist-cap" id="cg-mood-hist-cap" hidden></div>
+    </div>
+  </div>
+
+  <div class="cg-panel cg-people" id="cg-people">
+    <div class="cg-panel-head">
+      <span class="cg-panel-title">认识的人</span>
+      <span class="cg-panel-cap" id="cg-people-cap"></span>
+      <span class="cg-panel-act">
+        <button class="cg-btn sm" id="cg-person-create" type="button">新增</button>
+      </span>
+    </div>
+    <div class="cg-people-empty" id="cg-people-empty">正在读取人物…</div>
+    <div class="cg-people-list" id="cg-people-list" hidden></div>
+  </div>
+
+  <div class="cg-panel cg-prefs" id="cg-prefs">
+    <div class="cg-panel-head">
+      <span class="cg-panel-title">喜好</span>
+      <span class="cg-panel-cap" id="cg-prefs-cap"></span>
+      <span class="cg-panel-act">
+        <button class="cg-btn sm" id="cg-pref-create" type="button">新增</button>
+      </span>
+    </div>
+    <div class="cg-prefs-empty" id="cg-prefs-empty">正在读取喜好…</div>
+    <div class="cg-prefs-list" id="cg-prefs-list" hidden></div>
+    <p class="cg-prefs-tip" id="cg-prefs-tip">
+      这些是她自己的口味：首次启动时从宿主人设里提炼，之后随着聊天慢慢变浓或变淡。手动加的口味不会被自动观察改掉。
+    </p>
+  </div>
+
+  <div class="cg-panel cg-memories" id="cg-memories">
+    <div class="cg-panel-head">
+      <span class="cg-panel-title">记忆</span>
+      <span class="cg-panel-cap" id="cg-mem-cap"></span>
+      <span class="cg-panel-act">
+        <button class="cg-btn primary sm" id="cg-create" type="button">新增记忆</button>
+      </span>
+    </div>
+
+    <div class="cg-stats" id="cg-stats"></div>
+
+    <div class="cg-toolbar">
+      <div class="cg-field">
+        <span>会话</span>
+        <select id="cg-f-session"></select>
+      </div>
+      <div class="cg-field">
+        <span>状态</span>
+        <select id="cg-f-status"></select>
+      </div>
+      <div class="cg-field">
+        <span>类别</span>
+        <select id="cg-f-category"></select>
+      </div>
+      <input class="cg-search" id="cg-f-search" type="text" placeholder="搜索内容…" autocomplete="off">
+      <div class="cg-field">
+        <span>每页</span>
+        <select id="cg-f-limit">
+          <option value="25">25</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+        </select>
+      </div>
+      <span class="cg-spacer"></span>
+      <button class="cg-btn danger" id="cg-purge" type="button">清空该会话</button>
+    </div>
+
+    <div class="cg-list" id="cg-list"></div>
+
+    <div class="cg-pager">
+      <button class="cg-btn sm" id="cg-prev" type="button">上一页</button>
+      <button class="cg-btn sm" id="cg-next" type="button">下一页</button>
+      <span id="cg-pager-info"></span>
+    </div>
+  </div>
+
+  <!-- 弹窗与 toast 必须留在 .cg-root 内部：主题变量（--cg-bg 等）和控件样式
+       都定义在 .cg-root 上，放到外面会让 var() 变成未定义值，
+       background 声明失效 → 弹窗背景透明，底下的卡片会透出来。
+       弹窗本身是 position: fixed，放在这里不影响它相对视口定位。 -->
+  <div class="cg-modal" id="cg-edit-modal" hidden>
+  <div class="cg-modal-box" role="dialog" aria-modal="true" aria-labelledby="cg-edit-title">
+    <h2 id="cg-edit-title">编辑记忆</h2>
+    <p class="cg-modal-hint" id="cg-edit-hint"></p>
+    <div class="cg-form">
+      <div class="cg-form-row">
+        <label for="cg-edit-content">内容</label>
+        <textarea id="cg-edit-content" maxlength="4000"></textarea>
+      </div>
+      <div class="cg-form-grid">
+        <div class="cg-form-row">
+          <label for="cg-edit-category">类别</label>
+          <select id="cg-edit-category"></select>
+        </div>
+        <div class="cg-form-row">
+          <label for="cg-edit-status">状态</label>
+          <select id="cg-edit-status"></select>
+        </div>
+      </div>
+      <div class="cg-form-row">
+        <label for="cg-edit-salience">显著度</label>
+        <div class="cg-range-row">
+          <input id="cg-edit-salience" type="range" min="0" max="1" step="0.05" value="0.6">
+          <span class="cg-range-val" id="cg-edit-salience-val">0.60</span>
+        </div>
+      </div>
+    </div>
+    <div class="cg-modal-actions">
+      <button class="cg-btn primary" id="cg-edit-save" type="button">保存</button>
+      <button class="cg-btn" id="cg-edit-cancel" type="button">取消</button>
+      <span class="cg-spacer"></span>
+      <button class="cg-btn danger" id="cg-edit-delete" type="button">删除</button>
+    </div>
+  </div>
+</div>
+
+<div class="cg-modal" id="cg-create-modal" hidden>
+  <div class="cg-modal-box" role="dialog" aria-modal="true" aria-labelledby="cg-create-title">
+    <h2 id="cg-create-title">新增记忆</h2>
+    <p class="cg-modal-hint">手工写入的条目不做相似度去重，会原样保存。</p>
+    <div class="cg-form">
+      <div class="cg-form-row">
+        <label for="cg-create-session">所属会话</label>
+        <select id="cg-create-session"></select>
+      </div>
+      <div class="cg-form-row">
+        <label for="cg-create-content">内容</label>
+        <textarea id="cg-create-content" maxlength="4000" placeholder="用第三人称陈述句描述，例如：小鱼答应少刷B站给主人省 token。"></textarea>
+      </div>
+      <div class="cg-form-grid">
+        <div class="cg-form-row">
+          <label for="cg-create-category">类别</label>
+          <select id="cg-create-category"></select>
+        </div>
+        <div class="cg-form-row">
+          <label for="cg-create-salience">显著度</label>
+          <div class="cg-range-row">
+            <input id="cg-create-salience" type="range" min="0" max="1" step="0.05" value="0.6">
+            <span class="cg-range-val" id="cg-create-salience-val">0.60</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="cg-modal-actions">
+      <button class="cg-btn primary" id="cg-create-save" type="button">保存</button>
+      <button class="cg-btn" id="cg-create-cancel" type="button">取消</button>
+    </div>
+  </div>
+</div>
+
+<div class="cg-modal" id="cg-mood-modal" hidden>
+  <div class="cg-modal-box" role="dialog" aria-modal="true" aria-labelledby="cg-mood-title">
+    <h2 id="cg-mood-title">调整情绪</h2>
+    <p class="cg-modal-hint">手动设定会立即覆盖当前情绪，之后仍会随时间自然回落。愉悦度和情绪强度由下面八个基元算出，改它们没有意义，所以这里只能调基元和精力。</p>
+    <div class="cg-form">
+      <div class="cg-form-row">
+        <label for="cg-mood-in-joy">愉悦</label>
+        <div class="cg-range-row">
+          <input id="cg-mood-in-joy" type="range" min="0" max="1" step="0.05" value="0.25">
+          <span class="cg-range-val" id="cg-mood-in-joy-val">0.25</span>
+        </div>
+      </div>
+      <div class="cg-form-row">
+        <label for="cg-mood-in-anger">愤怒</label>
+        <div class="cg-range-row">
+          <input id="cg-mood-in-anger" type="range" min="0" max="1" step="0.05" value="0.05">
+          <span class="cg-range-val" id="cg-mood-in-anger-val">0.05</span>
+        </div>
+      </div>
+      <div class="cg-form-row">
+        <label for="cg-mood-in-anxiety">紧张</label>
+        <div class="cg-range-row">
+          <input id="cg-mood-in-anxiety" type="range" min="0" max="1" step="0.05" value="0.10">
+          <span class="cg-range-val" id="cg-mood-in-anxiety-val">0.10</span>
+        </div>
+      </div>
+      <div class="cg-form-row">
+        <label for="cg-mood-in-sadness">伤心</label>
+        <div class="cg-range-row">
+          <input id="cg-mood-in-sadness" type="range" min="0" max="1" step="0.05" value="0.05">
+          <span class="cg-range-val" id="cg-mood-in-sadness-val">0.05</span>
+        </div>
+      </div>
+      <div class="cg-form-row">
+        <label for="cg-mood-in-interest">兴趣</label>
+        <div class="cg-range-row">
+          <input id="cg-mood-in-interest" type="range" min="0" max="1" step="0.05" value="0.45">
+          <span class="cg-range-val" id="cg-mood-in-interest-val">0.45</span>
+        </div>
+      </div>
+      <div class="cg-form-row">
+        <label for="cg-mood-in-calm">平静</label>
+        <div class="cg-range-row">
+          <input id="cg-mood-in-calm" type="range" min="0" max="1" step="0.05" value="0.55">
+          <span class="cg-range-val" id="cg-mood-in-calm-val">0.55</span>
+        </div>
+      </div>
+      <div class="cg-form-row">
+        <label for="cg-mood-in-disgust">厌恶</label>
+        <div class="cg-range-row">
+          <input id="cg-mood-in-disgust" type="range" min="0" max="1" step="0.05" value="0.03">
+          <span class="cg-range-val" id="cg-mood-in-disgust-val">0.03</span>
+        </div>
+      </div>
+      <div class="cg-form-row">
+        <label for="cg-mood-in-surprise">惊讶</label>
+        <div class="cg-range-row">
+          <input id="cg-mood-in-surprise" type="range" min="0" max="1" step="0.05" value="0.10">
+          <span class="cg-range-val" id="cg-mood-in-surprise-val">0.10</span>
+        </div>
+      </div>
+      <div class="cg-form-row">
+        <label for="cg-mood-in-eng">精力</label>
+        <div class="cg-range-row">
+          <input id="cg-mood-in-eng" type="range" min="0" max="1" step="0.05" value="0.6">
+          <span class="cg-range-val" id="cg-mood-in-eng-val">0.60</span>
+        </div>
+      </div>
+    </div>
+    <div class="cg-modal-actions">
+      <button class="cg-btn primary" id="cg-mood-save" type="button">应用</button>
+      <button class="cg-btn" id="cg-mood-cancel" type="button">取消</button>
+    </div>
+    </div>
+  </div>
+
+  <div class="cg-modal" id="cg-person-modal" hidden>
+    <div class="cg-modal-box" role="dialog" aria-modal="true" aria-labelledby="cg-person-title">
+      <h2 id="cg-person-title">编辑人物</h2>
+      <p class="cg-modal-hint">关系由你设定后，插件就不会再用自动判断改它。密切程度（知己/朋友…）是由好感度算出来的，只会影响说话方式，不会当成称呼。</p>
+      <div class="cg-form">
+        <div class="cg-form-row">
+          <label for="cg-person-in-name">称呼</label>
+          <input id="cg-person-in-name" type="text" maxlength="16">
+          <!-- 账号只读展示：它是主键（person_key = platform:user_id），改名不会
+               改它，插件认人也只认它。放这里是为了用户在改名时能确认自己改的
+               就是那个人，而不是同名的那一个。 -->
+          <p class="cg-form-tip" id="cg-person-in-account"></p>
+        </div>
+        <div class="cg-form-row">
+          <label for="cg-person-in-role">关系</label>
+          <!-- 选项由 fillRoleOptions() 按配置页的身份表填，这里不能写死：
+               用户可以在配置页增删身份、改提示词。 -->
+          <select id="cg-person-in-role">
+            <option value="">（不设定，让插件自己判断）</option>
+          </select>
+        </div>
+        <div class="cg-form-row">
+          <label>关系六维</label>
+          <!-- 六维滑杆由 renderAxisSliders() 按后端下发的 axes 元数据动态生成，
+               不在这里写死：标签、说明、默认值都跟 cg_person.py 保持同一份真相。 -->
+          <div class="cg-axis-grid" id="cg-person-in-axes"></div>
+          <div class="cg-check-row">
+            <!-- 手调过六维之后，「感受跟着聊天走」就停了。没有这个开关的话
+                 用户只能改新值、没法让关系重新自己变化（第 43 轮）。 -->
+            <input id="cg-person-in-follow" type="checkbox">
+            <label for="cg-person-in-follow">让六维跟随聊天自动变化</label>
+          </div>
+          <p class="cg-form-tip" id="cg-person-axes-tip">这六个维度才是「关系」的真相，好感度是它们算出来的摘要。可以互相矛盾——比如很熟但不太信他。</p>
+        </div>
+        <div class="cg-form-row">
+          <label for="cg-person-in-affection">好感度（自动算）</label>
+          <div class="cg-range-row">
+            <input id="cg-person-in-affection" type="range" min="-100" max="100" step="5" value="0" disabled>
+            <span class="cg-range-val" id="cg-person-in-affection-val">0</span>
+          </div>
+          <p class="cg-form-tip" id="cg-person-level-hint"></p>
+        </div>
+        <div class="cg-form-row">
+          <label id="cg-person-in-tags-label">标签</label>
+          <div class="cg-tag-list" id="cg-person-in-tags"></div>
+          <div class="cg-tag-add">
+            <input id="cg-person-in-tag-new" type="text" maxlength="12" placeholder="例如 抽象的群友">
+            <button class="cg-btn sm" id="cg-person-in-tag-add" type="button">加</button>
+          </div>
+          <p class="cg-form-tip" id="cg-person-in-tags-tip">用「XX的XX」这种说法，比如「抽象的群友」「喜欢玩游戏的朋友」。最多 5 条。</p>
+        </div>
+      </div>
+      <div class="cg-modal-actions">
+        <button class="cg-btn primary" id="cg-person-save" type="button">保存</button>
+        <button class="cg-btn danger" id="cg-person-del" type="button">忘掉这个人</button>
+        <button class="cg-btn" id="cg-person-cancel" type="button">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="cg-modal" id="cg-person-create-modal" hidden>
+    <div class="cg-modal-box" role="dialog" aria-modal="true" aria-labelledby="cg-person-create-title">
+      <h2 id="cg-person-create-title">新增认识的人</h2>
+      <p class="cg-modal-hint">插件不会去读别的好感度插件，这里填什么就是什么。账号（QQ 号那种）是唯一必填项 —— 插件以后认人只看它，称呼是可以随便改的。</p>
+      <div class="cg-form">
+        <div class="cg-form-row">
+          <label for="cg-person-new-id">账号 / user_id</label>
+          <input id="cg-person-new-id" type="text" maxlength="64" placeholder="QQ 号，例如 10086">
+          <p class="cg-form-tip">填对方在这个平台上的账号。写昵称不行 —— 昵称会改，插件就认不出人了。</p>
+        </div>
+        <div class="cg-form-row">
+          <label for="cg-person-new-name">称呼</label>
+          <input id="cg-person-new-name" type="text" maxlength="16" placeholder="留空就用 user_id">
+        </div>
+        <div class="cg-form-row">
+          <label for="cg-person-new-platform">平台</label>
+          <input id="cg-person-new-platform" type="text" maxlength="32" placeholder="留空则自动判断">
+        </div>
+        <div class="cg-form-row">
+          <label for="cg-person-new-role">关系</label>
+          <!-- 同编辑弹窗：选项按配置页的身份表动态生成。 -->
+          <select id="cg-person-new-role">
+            <option value="">（不设定，让插件自己判断）</option>
+          </select>
+        </div>
+        <div class="cg-form-row">
+          <label>关系六维</label>
+          <div class="cg-axis-grid" id="cg-person-new-axes"></div>
+          <p class="cg-form-tip">不填就是中性基线。好感度会按这六维自动算出来。</p>
+        </div>
+        <div class="cg-form-row">
+          <label for="cg-person-new-affection">好感度（自动算）</label>
+          <div class="cg-range-row">
+            <input id="cg-person-new-affection" type="range" min="-100" max="100" step="5" value="0" disabled>
+            <span class="cg-range-val" id="cg-person-new-affection-val">0</span>
+          </div>
+          <p class="cg-form-tip" id="cg-person-new-level-hint"></p>
+        </div>
+        <div class="cg-form-row">
+          <label id="cg-person-new-tags-label">标签</label>
+          <div class="cg-tag-list" id="cg-person-new-tags"></div>
+          <div class="cg-tag-add">
+            <input id="cg-person-new-tag-new" type="text" maxlength="12" placeholder="例如 喜欢玩游戏的朋友">
+            <button class="cg-btn sm" id="cg-person-new-tag-add" type="button">加</button>
+          </div>
+          <p class="cg-form-tip" id="cg-person-new-tags-tip">用「XX的XX」这种说法，比如「抽象的群友」。最多 5 条。</p>
+        </div>
+      </div>
+      <div class="cg-modal-actions">
+        <button class="cg-btn primary" id="cg-person-new-save" type="button">新增</button>
+        <button class="cg-btn" id="cg-person-new-cancel" type="button">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="cg-modal" id="cg-pref-modal" hidden>
+    <div class="cg-modal-box">
+      <h2 id="cg-pref-title">编辑口味</h2>
+      <p class="cg-modal-hint">
+        强度表示这个口味有多浓。调低会让它更容易被淡忘；手动改过的口味不会被聊天里的自动观察覆盖。
+      </p>
+      <div class="cg-form">
+        <div class="cg-form-row">
+          <label for="cg-pref-in-kind">取向</label>
+          <select id="cg-pref-in-kind" disabled>
+            <option value="like">喜欢</option>
+            <option value="dislike">讨厌</option>
+          </select>
+        </div>
+        <div class="cg-form-row">
+          <label for="cg-pref-in-topic">话题</label>
+          <input id="cg-pref-in-topic" type="text" maxlength="24" placeholder="例如 猫">
+        </div>
+        <div class="cg-form-row">
+          <label for="cg-pref-in-strength">强度</label>
+          <input id="cg-pref-in-strength" type="range" min="0" max="1" step="0.05">
+          <span class="cg-range-val" id="cg-pref-in-strength-val">0.60</span>
+        </div>
+      </div>
+      <div class="cg-modal-actions">
+        <button class="cg-btn primary" id="cg-pref-save" type="button">保存</button>
+        <button class="cg-btn" id="cg-pref-cancel" type="button">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="cg-modal" id="cg-pref-create-modal" hidden>
+    <div class="cg-modal-box">
+      <h2>新增口味</h2>
+      <p class="cg-modal-hint">
+        写一条她自己的喜好或厌恶。话题只写一样东西（「猫」「被夸奖」），不要写长句。
+      </p>
+      <div class="cg-form">
+        <div class="cg-form-row">
+          <label for="cg-pref-new-kind">取向</label>
+          <select id="cg-pref-new-kind">
+            <option value="like">喜欢</option>
+            <option value="dislike">讨厌</option>
+          </select>
+        </div>
+        <div class="cg-form-row">
+          <label for="cg-pref-new-topic">话题</label>
+          <input id="cg-pref-new-topic" type="text" maxlength="24" placeholder="例如 猫">
+        </div>
+        <div class="cg-form-row">
+          <label for="cg-pref-new-strength">强度</label>
+          <input id="cg-pref-new-strength" type="range" min="0" max="1" step="0.05">
+          <span class="cg-range-val" id="cg-pref-new-strength-val">0.60</span>
+        </div>
+      </div>
+      <div class="cg-modal-actions">
+        <button class="cg-btn primary" id="cg-pref-new-save" type="button">新增</button>
+        <button class="cg-btn" id="cg-pref-new-cancel" type="button">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="cg-toast" id="cg-toast" hidden></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var M = window.maibot;
+  var MAX_CONTENT = 4000;
+
+  // 记忆列表默认只看「活跃」（active）。
+  //
+  // 为什么不默认「全部状态」：列表按显著度降序排，而 resolved（话题已解决）
+  // 与 expired（自然过期）里存着大量高分历史条目 —— 恢复记忆那次实测，
+  // 第一屏 6 条全是 0.9~0.95 的 resolved，而当时真正在用的 291 条 active
+  // 显著度只有 0.5~0.6，全被挤到后面去。用户看到的就是「显著度好像没变」。
+  //
+  // 注意这不改变任何数据，只是给下拉框选个初始值；想翻历史仍然可以切回去。
+  var DEFAULT_STATUS_FILTER = 'active';
+
+  var state = {
+    sessions: [],
+    items: [],
+    total: 0,
+    offset: 0,
+    limit: 50,
+    filters: { session_id: '', status: DEFAULT_STATUS_FILTER, category: '', search: '' },
+    editing: null,
+    labels: { category: {}, status: {} }
+  };
+
+  function $(id) { return document.getElementById(id); }
+
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+
+  function toast(message, kind) {
+    var box = $('cg-toast');
+    box.textContent = String(message);
+    box.className = 'cg-toast' + (kind ? ' ' + kind : '');
+    box.hidden = false;
+    clearTimeout(toast._timer);
+    toast._timer = setTimeout(function () { box.hidden = true; }, 3600);
+  }
+
+  function fail(res, fallback) {
+    var message = (res && res.error) || fallback || '操作失败';
+    toast(message, 'err');
+    return null;
+  }
+
+  function fmtTime(ts) {
+    if (!ts) return '—';
+    var d = new Date(ts * 1000);
+    if (isNaN(d.getTime())) return '—';
+    var pad = function (n) { return n < 10 ? '0' + n : String(n); };
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+
+  // 愉悦度是 -1..1，正数要显式带 +，否则「0.35」和「-0.35」看起来一样重。
+  function fmtSigned(value) {
+    var num = Number(value);
+    if (!isFinite(num)) return '—';
+    return (num >= 0 ? '+' : '') + num.toFixed(2);
+  }
+
+  function fillSelect(select, options, current) {
+    select.textContent = '';
+    options.forEach(function (opt) {
+      var node = el('option', null, opt.label);
+      node.value = opt.value;
+      if (String(opt.value) === String(current)) node.selected = true;
+      select.appendChild(node);
+    });
+  }
+
+  // ── 数据加载 ──
+
+  function loadStats() {
+    return M.query('stats', {}).then(function (res) {
+      if (!res || res.ok !== true) { fail(res, '读取统计失败'); return; }
+      var box = $('cg-stats');
+      box.textContent = '';
+      var statusMap = res.items_by_status || {};
+      var chips = [
+        // 总数要把「遗忘」算进去：遗忘的条目还在库里，只是不主动读取。
+        // 少算它会让总数和下面各状态之和对不上，用户会以为丢了数据。
+        ['条目总数', (statusMap.active || 0) + (statusMap.resolved || 0) + (statusMap.expired || 0) + (statusMap.forgotten || 0)],
+        ['活跃', statusMap.active || 0],
+        ['已解决', statusMap.resolved || 0],
+        ['已过期', statusMap.expired || 0],
+        ['遗忘', statusMap.forgotten || 0],
+        ['会话', res.sessions || 0],
+        ['抽取成功/总', (res.extractions_ok || 0) + '/' + (res.extractions || 0)],
+        ['注入次数', res.injections || 0]
+      ];
+      if (res.items_pinned) chips.push(['置顶', res.items_pinned]);
+      if (res.items_doubted) chips.push(['存疑', res.items_doubted]);
+      if (res.avg_injection_ms) chips.push(['注入均耗时', Number(res.avg_injection_ms).toFixed(2) + ' ms']);
+      chips.forEach(function (pair) {
+        var chip = el('span', 'cg-chip');
+        chip.appendChild(document.createTextNode(pair[0] + ' '));
+        chip.appendChild(el('b', null, pair[1]));
+        box.appendChild(chip);
+      });
+      if (res.categories && res.categories.length) {
+        state.labels.category = {};
+        res.categories.forEach(function (item) { state.labels.category[item.value] = item.label; });
+      }
+      if (res.statuses && res.statuses.length) {
+        state.labels.status = {};
+        res.statuses.forEach(function (item) { state.labels.status[item.value] = item.label; });
+      }
+    }).catch(function (err) { toast('读取统计失败：' + err, 'err'); });
+  }
+
+  function loadMood() {
+    return M.query('mood', {}).then(function (res) {
+      var empty = $('cg-mood-empty');
+      var body = $('cg-mood-body');
+      if (!res || res.ok !== true) {
+        empty.hidden = false;
+        empty.textContent = (res && res.error) || '读取情绪失败';
+        body.hidden = true;
+        return;
+      }
+      state.mood = res;
+      empty.hidden = true;
+      body.hidden = false;
+
+      $('cg-mood-label').textContent = res.label || '—';
+      var reason = res.reason ? '因为' + res.reason : '';
+      if (res.enabled === false) reason = '情绪模拟已关闭' + (reason ? '；' + reason : '');
+      $('cg-mood-reason').textContent = reason;
+
+      setBar('val', res.valence, -1, 1, res.valence);
+      setBar('aro', res.arousal, 0, 1, res.arousal);
+      setBar('eng', res.energy, 0, 1, res.energy);
+      renderPrimitives(res);
+
+      // 语气块用 res.tone（只有语气），精力块用 res.desire / res.length。
+      // 不能都用 res.guidance：那里面已经拼了精力两句，面板再单独显示精力块就会重复。
+      var guide = $('cg-mood-guide');
+      guide.textContent = '';
+      var toneText = res.tone || '';
+      if (res.guidance) {
+        if (toneText) {
+          guide.appendChild(el('b', null, '当前语气要求：'));
+          guide.appendChild(document.createTextNode(' ' + toneText));
+        } else {
+          // 只剩精力那句（情绪平稳时不额外给语气），那就直接说明。
+          guide.textContent = '当前没有额外的语气要求，只有下面的精力影响。';
+        }
+      } else {
+        guide.textContent = '没有附加行为指令（配置里 include_guidance 已关闭）。';
+      }
+
+      // 精力是独立于语气的一条轴：语气决定「怎么说」，精力决定「想不想聊、说多少」。
+      // 它**不再影响发言频率**（那样 Bot 会时灵时不灵，很不自然），只影响这两件事，
+      // 所以面板上把两者分开写清楚，用户才知道调精力到底会改什么。
+      var effort = $('cg-mood-effort');
+      effort.textContent = '';
+      if (res.exhausted) {
+        effort.className = 'cg-mood-effort exhausted';
+        effort.appendChild(el('b', null, '精力见底：'));
+        effort.appendChild(document.createTextNode(
+          '不再主动发言，被 @ 或点名才回；精力回到阈值后自动恢复。'
+        ));
+        if (res.length) effort.appendChild(document.createTextNode(' ' + res.length));
+        effort.hidden = false;
+      } else if (res.desire || res.length) {
+        effort.className = 'cg-mood-effort';
+        effort.appendChild(el('b', null, '精力影响：'));
+        // 两段话各自成行：并排写会挤成一长串（「回复欲望…回复长度…」连在一起），
+        // 用户读不出这是两件不同的事。
+        if (res.desire) {
+          var desireLine = el('span', 'cg-mood-effort-line');
+          desireLine.appendChild(el('b', null, '回复欲望 '));
+          desireLine.appendChild(document.createTextNode(res.desire));
+          effort.appendChild(desireLine);
+        }
+        if (res.length) {
+          var lengthLine = el('span', 'cg-mood-effort-line');
+          lengthLine.appendChild(el('b', null, '回复长度 '));
+          lengthLine.appendChild(document.createTextNode(res.length));
+          effort.appendChild(lengthLine);
+        }
+        effort.hidden = false;
+      } else {
+        effort.hidden = true;
+      }
+
+      // 面板标题右侧的一句话摘要，和另外两个模块的 cap 位置对齐。
+      var cap = $('cg-mood-cap');
+      cap.textContent = (res.label || '—') +
+        '（愉悦 ' + fmtSigned(res.valence) + ' / 强度 ' +
+        Number(res.arousal || 0).toFixed(2) + ' / 精力 ' +
+        Number(res.energy || 0).toFixed(2) + '）';
+    }).catch(function (err) {
+      var empty = $('cg-mood-empty');
+      empty.hidden = false;
+      empty.textContent = '读取情绪失败：' + err;
+      $('cg-mood-body').hidden = true;
+    }).then(loadMoodHistory);
+  }
+
+  // 情绪走势：用最近若干次记录画一排小柱，正值朝上绿、负值红。
+  // 没有历史（刚装或刚重置）时整块隐藏，不留空白。
+  function loadMoodHistory() {
+    return M.query('mood_history', { limit: 40 }).then(function (res) {
+      var box = $('cg-mood-hist');
+      var cap = $('cg-mood-hist-cap');
+      box.textContent = '';
+      if (!res || res.ok !== true || !res.points || res.points.length < 2) {
+        cap.hidden = true;
+        box.hidden = true;
+        return;
+      }
+      box.hidden = false;
+      var points = res.points.slice().reverse();
+      var maxAbs = 0.001;
+      points.forEach(function (p) {
+        var v = Math.abs(Number(p.valence) || 0);
+        if (v > maxAbs) maxAbs = v;
+      });
+      points.forEach(function (p) {
+        var v = Number(p.valence) || 0;
+        var bar = el('i');
+        var h = Math.max(8, Math.round((Math.abs(v) / maxAbs) * 100));
+        bar.style.height = h + '%';
+        if (v > 0.05) bar.className = 'pos';
+        else if (v < -0.05) bar.className = 'neg';
+        bar.title = fmtTime(p.ts) + ' · ' + (p.label || '—') + ' · 愉悦 ' + v.toFixed(2);
+        box.appendChild(bar);
+      });
+      cap.hidden = false;
+      cap.textContent = '最近 ' + points.length + ' 次情绪记录（最左最早）';
+    }).catch(function () {
+      $('cg-mood-hist').hidden = true;
+      $('cg-mood-hist-cap').hidden = true;
+    });
+  }
+
+  // 八个情绪基元各自一条进度条，并在上面标出「基线」位置。
+  // 只显示数值是不够的：anger 0.3 对温和人格是「很生气」，对暴躁人格是常态，
+  // 有意义的是「当前值相对基线偏了多少」，所以必须画出基线参考线。
+  var PRIMITIVE_ORDER = ['joy', 'anger', 'anxiety', 'sadness', 'interest', 'calm', 'disgust', 'surprise'];
+  var PRIMITIVE_FALLBACK_LABELS = {
+    joy: '愉悦', anger: '愤怒', anxiety: '紧张', sadness: '伤心',
+    interest: '兴趣', calm: '平静', disgust: '厌恶', surprise: '惊讶'
+  };
+
+  function renderPrimitives(res) {
+    var box = $('cg-mood-prims');
+    if (!box) return;
+    box.textContent = '';
+    var values = res.primitives || {};
+    var labels = res.primitive_labels || PRIMITIVE_FALLBACK_LABELS;
+    var bases = res.baselines || {};
+    PRIMITIVE_ORDER.forEach(function (name) {
+      var value = Number(values[name]);
+      if (isNaN(value)) return;
+      var base = Number(bases[name]);
+      var wrap = el('div', 'cg-mood-bar');
+      var head = el('div', 'cg-mood-bar-head');
+      head.appendChild(el('span', null, labels[name] || name));
+      // 注意 el() 的第二个参数是 class 字符串，不是属性对象 ——
+      // 传对象进去 className 会变成 "[object Object]"，id 也设不上。
+      var num = el('b', null, value.toFixed(2));
+      num.id = 'cg-mood-prim-' + name + '-txt';
+      head.appendChild(num);
+      wrap.appendChild(head);
+
+      var track = el('div', 'cg-mood-track');
+      var fill = el('div', 'cg-mood-fill ' + name);
+      fill.id = 'cg-mood-prim-' + name + '-bar';
+      fill.style.width = Math.round(Math.max(0, Math.min(1, value)) * 100) + '%';
+      track.appendChild(fill);
+      if (!isNaN(base)) {
+        var mark = el('i');
+        mark.style.left = Math.round(Math.max(0, Math.min(1, base)) * 100) + '%';
+        mark.title = '基线 ' + base.toFixed(2);
+        track.appendChild(mark);
+      }
+      wrap.appendChild(track);
+      box.appendChild(wrap);
+    });
+  }
+
+  // ── 人物认知面板 ──
+  // 只展示，不在这里编辑关系（编辑走弹窗）。关系角色是「事实」，
+  // 密切程度是由好感度推出来的，所以卡片上要分开写清楚，
+  // 否则用户会以为「知己」也是自己设定的。
+  //
+  // 身份表和分级表都由后端下发（mem_people 的 roles / levels），不能在前端写死：
+  // 用户第 33 轮要求在配置页自由增删身份、调整好感度分级的阈值。
+  var ROLE_TABLE = [];
+  var LEVEL_TABLE = [];
+  // 关系六维的定义（key/label/hint/default）也由后端下发。用户第 34 轮
+  // 把「一个好感度数字」换成了六维，标签和说明都写在 cg_person.py 里，
+  // 前端再抄一份就会两处漂移。
+  var AXIS_TABLE = [];
+
+  function roleLabelOf(role) {
+    var key = String(role || '');
+    for (var i = 0; i < ROLE_TABLE.length; i += 1) {
+      if (ROLE_TABLE[i].value === key) return ROLE_TABLE[i].label;
+    }
+    return key || '陌生人';
+  }
+
+  // 好感度到多少算这一档。用来在弹窗里给个「现在会算成什么」的提示，
+  // 免得用户改完滑块还要回头翻配置页才知道阈值。
+  function levelHint(affection) {
+    var score = Number(affection);
+    if (isNaN(score)) score = 0;
+    for (var i = 0; i < LEVEL_TABLE.length; i += 1) {
+      var row = LEVEL_TABLE[i];
+      if (score >= Number(row.min_affection)) {
+        return '现在算「' + row.label + '」（下限 ' + Number(row.min_affection).toFixed(0) + '）';
+      }
+    }
+    return '';
+  }
+
+  // 把配置页的身份表灌进 <select>。第一项固定是「不设定」。
+  function fillRoleOptions(select, current) {
+    if (!select) return;
+    // 用 removeChild 而不是 innerHTML = ''：整页禁止 innerHTML 赋值
+    // （记忆内容里的 HTML 不能被解释），这条规矩对下拉框也一样。
+    while (select.firstChild) select.removeChild(select.firstChild);
+    var blank = document.createElement('option');
+    blank.value = '';
+    blank.textContent = '（不设定，让插件自己判断）';
+    select.appendChild(blank);
+    ROLE_TABLE.forEach(function (row) {
+      var opt = document.createElement('option');
+      opt.value = row.value;
+      opt.textContent = row.label;
+      select.appendChild(opt);
+    });
+    select.value = current || '';
+    // 配置页里删掉了某个身份，但库里还有人是那个身份 —— 补一项，否则
+    // 下拉框会静默跳到「不设定」，用户一保存就把原来的关系抹了。
+    if (current && select.value !== current) {
+      var stale = document.createElement('option');
+      stale.value = current;
+      stale.textContent = current + '（配置里已没有这个身份）';
+      select.appendChild(stale);
+      select.value = current;
+    }
+  }
+
+  function personBar(value) {
+    var num = Number(value);
+    if (isNaN(num)) num = 0;
+    // 好感度 -100..100 映射到 0..100%
+    var pct = Math.max(0, Math.min(100, ((num + 100) / 200) * 100));
+    var track = el('div', 'cg-person-bar');
+    var fill = el('i');
+    fill.style.width = pct.toFixed(1) + '%';
+    track.appendChild(fill);
+    return track;
+  }
+
+  // ── 关系六维 ──
+  // 六维是真相，好感度是摘要。前端**不算**好感度（后端 payload 里带着现算的
+  // affection），但需要按维度值画条和滑杆。
+  function axisValueOf(person, key) {
+    var axes = (person && person.axes) || {};
+    var value = Number(axes[key]);
+    if (isNaN(value)) {
+      // 后端没给就退回这一维的基线，而不是 0：0 对 familiarity 这种
+      // 基线就是 0 的维度没问题，对 trust（基线 0.35）会显示成「完全不信任」。
+      for (var i = 0; i < AXIS_TABLE.length; i += 1) {
+        if (AXIS_TABLE[i].key === key) return Number(AXIS_TABLE[i].default) || 0;
+      }
+      return 0;
+    }
+    return Math.max(0, Math.min(1, value));
+  }
+
+  // 卡片上那六个小条。tension 高是「坏」，所以单独标色。
+  function renderAxesMini(person) {
+    var box = el('div', 'cg-axes-mini');
+    AXIS_TABLE.forEach(function (axis) {
+      var value = axisValueOf(person, axis.key);
+      var row = el('div', 'cg-axis-mini');
+      if (axis.key === 'tension' && value >= 0.5) row.classList.add('hot');
+      row.appendChild(el('span', null, axis.label));
+      var track = el('b');
+      var fill = el('i');
+      fill.style.width = (value * 100).toFixed(0) + '%';
+      track.appendChild(fill);
+      row.appendChild(track);
+      row.title = axis.label + ' ' + (value * 100).toFixed(0) + '% — ' + axis.hint;
+      box.appendChild(row);
+    });
+    return box;
+  }
+
+  // 弹窗里的六个滑杆。values 是 {key: 0..1}，缺的用基线补。
+  function renderAxisSliders(container, values) {
+    if (!container) return;
+    while (container.firstChild) container.removeChild(container.firstChild);
+    var base = values || {};
+    AXIS_TABLE.forEach(function (axis) {
+      var value = base[axis.key];
+      if (value === undefined || value === null || isNaN(Number(value))) {
+        value = Number(axis.default) || 0;
+      }
+      value = Math.max(0, Math.min(1, Number(value)));
+
+      var row = el('div', 'cg-axis-row');
+      var label = el('label', null, axis.label);
+      label.setAttribute('for', 'cg-axis-in-' + axis.key);
+      row.appendChild(label);
+
+      var input = document.createElement('input');
+      input.type = 'range';
+      input.min = '0';
+      input.max = '1';
+      input.step = '0.05';
+      input.id = 'cg-axis-in-' + axis.key;
+      input.value = String(value);
+      input.setAttribute('data-axis', axis.key);
+      row.appendChild(input);
+
+      var val = el('span', 'cg-range-val', value.toFixed(2));
+      row.appendChild(val);
+      row.appendChild(el('div', 'cg-axis-hint', axis.hint));
+
+      input.addEventListener('input', function () {
+        val.textContent = Number(input.value).toFixed(2);
+      });
+      container.appendChild(row);
+    });
+  }
+
+  function collectAxisValues(container) {
+    var out = {};
+    if (!container) return out;
+    var inputs = container.querySelectorAll('input[data-axis]');
+    for (var i = 0; i < inputs.length; i += 1) {
+      var key = inputs[i].getAttribute('data-axis');
+      var num = Number(inputs[i].value);
+      if (!key || isNaN(num)) continue;
+      out[key] = Math.max(0, Math.min(1, num));
+    }
+    return out;
+  }
+
+  // 平台名转成人能认的写法。插件只认 platform:user_id，页面得把它翻译回来 ——
+  // 光看一个 「100000001」 谁也不知道那是 QQ 号还是别的什么。
+  function platformLabel(platform) {
+    var key = String(platform || '').trim().toLowerCase();
+    if (key === 'qq') return 'QQ';
+    if (key === 'telegram' || key === 'tg') return 'TG';
+    if (key === 'discord') return 'Discord';
+    if (key === 'wechat' || key === 'wx') return '微信';
+    return String(platform || '').trim();
+  }
+
+  // 卡片上那行「QQ 100000001」。
+  // 昵称可以改、可以重名，出问题时第一个要问的就是「这是哪个人」，所以账号
+  // 必须一直看得见，而且**任何情况下都要带着号码**。曾经这里为了少写一个重复
+  // 的数字，在昵称等于账号时只返回平台名，结果那一行变成光秃秃的「QQ」——
+  // 账号反而没显示出来。群名片本来就允许等于账号（真机上 100000004 这个人
+  // 就是把群名片设成了自己的 QQ 号），那是正常数据，不是异常。
+  function accountText(person) {
+    var uid = String((person && person.user_id) || '').trim();
+    if (!uid) return '';
+    var label = platformLabel(person && person.platform);
+    return (label ? label + ' ' : '') + uid;
+  }
+
+  function renderPerson(person) {
+    var card = el('div', 'cg-person');
+
+    var top = el('div', 'cg-person-top');
+    var uid = String((person && person.user_id) || '').trim();
+    var display = String((person && person.display_name) || '').trim();
+    // 群名片和账号是同一个字符串时只渲染一份：账号那栏已经把它写在「QQ」后面
+    // 了，再在名字位置重复一遍，读者会先怀疑是渲染 bug，而不是「他把群名片
+    // 改成了自己的号」。名字是给人记的，账号是认人用的，重复时留账号。
+    if (display && display !== uid) {
+      top.appendChild(el('span', 'cg-person-name', display));
+    } else if (!uid) {
+      top.appendChild(el('span', 'cg-person-name', '(未命名)'));
+    }
+    var account = accountText(person);
+    if (account) {
+      var idSpan = el('span', 'cg-person-id', account);
+      idSpan.title = '对方在平台上的账号，插件认人就靠它';
+      top.appendChild(idSpan);
+    }
+    var roleLabel = roleLabelOf(person.relation_role);
+    var roleBadge = el('span', 'cg-badge', roleLabel);
+    if (person.is_manual) roleBadge.classList.add('manual');
+    roleBadge.title = person.is_manual
+      ? '你手动设定的，自动判断不会改它'
+      : '自动判断的，置信度 ' + Number(person.role_confidence || 0).toFixed(2);
+    top.appendChild(roleBadge);
+    // 密切度和角色常常算出同一个词（好感度一般的人既「朋友」又「朋友」），
+    // 那时候再挂一枚一模一样的徽章只是噪音，看着像重复渲染的 bug。
+    if (person.intimacy_label && person.intimacy_label !== roleLabel) {
+      var inti = el('span', 'cg-badge', person.intimacy_label);
+      inti.title = '由好感度推出（不是称呼，只影响说话方式）';
+      top.appendChild(inti);
+    }
+    var acts = el('div', 'cg-person-act');
+    var editBtn = el('button', 'cg-btn sm', '编辑');
+    editBtn.type = 'button';
+    editBtn.addEventListener('click', function () { openPerson(person); });
+    acts.appendChild(editBtn);
+    top.appendChild(acts);
+    card.appendChild(top);
+
+    var meta = el('div', 'cg-person-meta');
+    // 账号已经挪到标题行（带平台名），这里不再重复一遍 —— 昵称本身就是号的
+    // 那些记录会让同一行出现两个一样的数字。
+    meta.appendChild(el('span', null, '好感 ' + Number(person.affection || 0).toFixed(0)));
+    meta.appendChild(personBar(person.affection));
+    var impact = Number(person.emotional_impact || 0);
+    var impactText = impact >= 0.25 ? '和他聊完会开心些'
+      : impact <= -0.25 ? '和他聊完有点累'
+      : '情绪影响不明显';
+    meta.appendChild(el('span', null, impactText));
+    card.appendChild(meta);
+
+    // 六维小条：一眼看出哪一维偏离基线最多。
+    if (AXIS_TABLE.length) card.appendChild(renderAxesMini(person));
+
+    // 矛盾描述（「你们混得很熟，但有些话你还是不跟他说」）。
+    // 这是整个面板最有信息量的一行，比六个百分比好读得多。
+    var voice = (person.contrasts && person.contrasts.length)
+      ? person.contrasts[0]
+      : '';
+    if (voice) card.appendChild(el('div', 'cg-person-voice', voice));
+
+    if (person.tags && person.tags.length) {
+      var tagBox = el('div', 'cg-person-notes');
+      tagBox.appendChild(el('span', 'cg-person-note-cap', '你打的标签'));
+      person.tags.forEach(function (tag) { tagBox.appendChild(el('span', 'cg-person-note', tag)); });
+      card.appendChild(tagBox);
+    }
+    return card;
+  }
+
+  function loadPeople() {
+    var box = $('cg-people-list');
+    var empty = $('cg-people-empty');
+    var cap = $('cg-people-cap');
+    if (!box) return Promise.resolve();
+    return M.query('people', { limit: 200 }).then(function (res) {
+      if (!res || res.ok !== true) {
+        empty.textContent = '读取人物失败：' + ((res && res.error) || '未知错误');
+        empty.hidden = false;
+        box.hidden = true;
+        return;
+      }
+      var people = res.people || [];
+      // 身份表与分级表由后端下发，页面不写死。空响应时保留上一次的表，
+      // 免得某次查询失败把下拉框清空。
+      if (res.roles && res.roles.length) ROLE_TABLE = res.roles;
+      if (res.levels && res.levels.length) LEVEL_TABLE = res.levels;
+      if (res.axes && res.axes.length) AXIS_TABLE = res.axes;
+      if (!people.length) {
+        empty.textContent = '还没有记住任何人。点右上角「新增」手动加，或者等抽取跑过几轮自动认人。';
+        empty.hidden = false;
+        box.hidden = true;
+        cap.textContent = '';
+        return;
+      }
+      box.textContent = '';
+      people.forEach(function (person) { box.appendChild(renderPerson(person)); });
+      empty.hidden = true;
+      box.hidden = false;
+      var manual = people.filter(function (p) { return p.is_manual; }).length;
+      cap.textContent = '共 ' + people.length + ' 人' + (manual ? '，其中 ' + manual + ' 个是手动设定' : '');
+    }).catch(function (err) {
+      empty.textContent = '读取人物失败：' + err;
+      empty.hidden = false;
+      box.hidden = true;
+    });
+  }
+
+  function setBar(name, value, min, max, display) {
+    var num = Number(value);
+    if (isNaN(num)) num = 0;
+    var span = max - min;
+    var pct = span > 0 ? ((num - min) / span) * 100 : 0;
+    pct = Math.max(0, Math.min(100, pct));
+    $('cg-mood-' + name + '-bar').style.width = pct.toFixed(1) + '%';
+    $('cg-mood-' + name + '-txt').textContent = Number(display).toFixed(2);
+  }
+
+  function loadSessions() {
+    return M.query('sessions', {}).then(function (res) {
+      if (!res || res.ok !== true) { fail(res, '读取会话失败'); return; }
+      state.sessions = res.sessions || [];
+      var options = [{ value: '', label: '全部会话' }];
+      state.sessions.forEach(function (item) {
+        var count = item.total_count ? ' (' + item.active_count + ' 活跃/' + item.total_count + ')' : '';
+        options.push({ value: item.session_id, label: (item.label || item.session_id) + count });
+      });
+      fillSelect($('cg-f-session'), options, state.filters.session_id);
+      fillSelect($('cg-create-session'), options.slice(1), '');
+      $('cg-purge').disabled = !state.filters.session_id;
+    }).catch(function (err) { toast('读取会话失败：' + err, 'err'); });
+  }
+
+  function currentArgs() {
+    return {
+      session_id: state.filters.session_id,
+      status: state.filters.status,
+      category: state.filters.category,
+      search: state.filters.search,
+      limit: state.limit,
+      offset: state.offset
+    };
+  }
+
+  function loadItems() {
+    var list = $('cg-list');
+    list.textContent = '';
+    list.appendChild(el('div', 'cg-loading', '加载中…'));
+    return M.query('items', currentArgs()).then(function (res) {
+      if (!res || res.ok !== true) { fail(res, '读取记忆失败'); list.textContent = ''; return; }
+      state.items = res.items || [];
+      state.total = res.total || 0;
+      renderItems();
+    }).catch(function (err) {
+      list.textContent = '';
+      list.appendChild(el('div', 'cg-empty', '读取失败：' + err));
+    });
+  }
+
+  // ── 渲染 ──
+
+  function renderItems() {
+    var list = $('cg-list');
+    list.textContent = '';
+    if (!state.items.length) {
+      list.appendChild(el('div', 'cg-empty', state.filters.search ? '没有匹配「' + state.filters.search + '」的记忆' : '还没有记忆。等群里聊几轮，或者点右上角「新增记忆」手动写一条。'));
+    } else {
+      state.items.forEach(function (item) {
+        list.appendChild(renderItem(item));
+      });
+    }
+    var start = state.total ? state.offset + 1 : 0;
+    var end = state.offset + state.items.length;
+    $('cg-pager-info').textContent = '第 ' + start + '–' + end + ' 条 / 共 ' + state.total + ' 条';
+    $('cg-prev').disabled = state.offset <= 0;
+    $('cg-next').disabled = end >= state.total;
+
+    // 模块标题右侧的一句话摘要，和另外两个模块对齐。
+    var cap = $('cg-mem-cap');
+    if (cap) {
+      cap.textContent = state.filters.search
+        ? '匹配 ' + state.total + ' 条'
+        : '共 ' + state.total + ' 条';
+    }
+  }
+
+  function renderItem(item) {
+    var card = el('div', 'cg-item' + (item.status === 'forgotten' ? ' is-forgotten' : ''));
+
+    var top = el('div', 'cg-item-top');
+    top.appendChild(el('span', 'cg-id', '#' + item.id));
+    top.appendChild(el('span', 'cg-badge cat-' + item.category, item.category_label || item.category));
+    top.appendChild(el('span', 'cg-badge st-' + item.status, item.status_label || item.status));
+    if (item.pinned) {
+      var pinBadge = el('span', 'cg-badge pinned', '置顶');
+      pinBadge.title = '置顶的记忆不会被衰减、不会被遗忘，也不会被条数上限挤掉';
+      top.appendChild(pinBadge);
+    }
+    if (item.doubted) {
+      var doubtBadge = el('span', 'cg-badge doubted', '存疑');
+      doubtBadge.title = '模型判断这条不太可信（可信度 ' + Number(item.truth_score).toFixed(2) + '）。不删除，只是注入时会带一句「你自己也不太确定」';
+      top.appendChild(doubtBadge);
+    }
+    top.appendChild(el('span', 'cg-sal', '显著度 ' + Number(item.salience).toFixed(2)));
+    if (item.source_count > 1) top.appendChild(el('span', 'cg-sal', '合并 ' + item.source_count + ' 次'));
+    // 注入轮换的账目：光看显著度看不出「这条每轮都在用」。
+    // 连击 >= 2 时高亮一下，提示它正在被轮换机制往后压。
+    if (item.inject_count > 0) {
+      var injectBadge = el('span', 'cg-sal', '注入 ' + item.inject_count + ' 次');
+      injectBadge.title = '这条记忆被写进提示词的累计次数'
+        + (item.last_injected_ts ? '，最近一次是 ' + fmtTime(item.last_injected_ts) : '');
+      top.appendChild(injectBadge);
+    }
+    if (item.inject_streak >= 2) {
+      var streakBadge = el('span', 'cg-badge streak', '连刷 ' + item.inject_streak);
+      streakBadge.title = '连续 ' + item.inject_streak + ' 轮被注入。开启注入轮换时它会被自动往后排，让别的话题有机会进来';
+      top.appendChild(streakBadge);
+    }
+
+    var actions = el('div', 'cg-item-actions');
+    // 遗忘的条目给一个「想起」按钮，把它拉回活跃状态。
+    if (item.status === 'forgotten') {
+      var recallBtn = el('button', 'cg-btn sm', '想起');
+      recallBtn.type = 'button';
+      recallBtn.title = '把它重新想起来，恢复成活跃状态';
+      recallBtn.addEventListener('click', function () { recallItem(item); });
+      actions.appendChild(recallBtn);
+    }
+    var pinBtn = el('button', 'cg-btn sm', item.pinned ? '取消置顶' : '置顶');
+    pinBtn.type = 'button';
+    pinBtn.title = item.pinned
+      ? '取消置顶后它会重新参与衰减'
+      : '置顶后这条不会被衰减、不会被遗忘';
+    pinBtn.addEventListener('click', function () { togglePin(item); });
+    actions.appendChild(pinBtn);
+    var editBtn = el('button', 'cg-btn sm', '编辑');
+    editBtn.type = 'button';
+    editBtn.addEventListener('click', function () { openEdit(item); });
+    var delBtn = el('button', 'cg-btn sm danger', '删除');
+    delBtn.type = 'button';
+    delBtn.addEventListener('click', function () { removeItem(item); });
+    actions.appendChild(editBtn);
+    actions.appendChild(delBtn);
+    top.appendChild(actions);
+    card.appendChild(top);
+
+    card.appendChild(el('div', 'cg-content', item.content));
+
+    var meta = el('div', 'cg-meta');
+    meta.appendChild(el('span', null, '首次 ' + fmtTime(item.first_seen_ts)));
+    meta.appendChild(el('span', null, '最近 ' + fmtTime(item.last_seen_ts)));
+    if (item.expires_at) meta.appendChild(el('span', null, '过期 ' + fmtTime(item.expires_at)));
+    if (item.forgotten_at) meta.appendChild(el('span', null, '遗忘于 ' + fmtTime(item.forgotten_at)));
+    if (item.last_recalled_ts) meta.appendChild(el('span', null, '想起于 ' + fmtTime(item.last_recalled_ts)));
+    var sessionLabel = sessionName(item.session_id);
+    if (sessionLabel) meta.appendChild(el('span', null, sessionLabel));
+    card.appendChild(meta);
+
+    return card;
+  }
+
+  // ── 置顶 / 想起 ──
+
+  function togglePin(item) {
+    var next = !item.pinned;
+    M.action('pin', { item_id: item.id, pinned: next }).then(function (res) {
+      if (!res || res.ok === false) {
+        toast((res && res.error) || '置顶失败', 'err');
+        return;
+      }
+      toast(next ? '已置顶，这条不会再被遗忘' : '已取消置顶');
+      loadItems();
+    });
+  }
+
+  function recallItem(item) {
+    M.action('recall', { item_id: item.id }).then(function (res) {
+      if (!res || res.ok === false) {
+        toast((res && res.error) || '想不起来', 'err');
+        return;
+      }
+      toast('想起来了');
+      loadItems();
+    });
+  }
+
+  function sessionName(sessionId) {
+    for (var i = 0; i < state.sessions.length; i += 1) {
+      if (state.sessions[i].session_id === sessionId) return state.sessions[i].label || sessionId;
+    }
+    return sessionId;
+  }
+
+  // ── 编辑 ──
+
+  function openEdit(item) {
+    state.editing = item;
+    $('cg-edit-title').textContent = '编辑记忆 #' + item.id;
+    $('cg-edit-hint').textContent = '会话 ' + sessionName(item.session_id) + ' · 首次写入 ' + fmtTime(item.first_seen_ts) +
+      ' · 来源合并 ' + (item.source_count || 1) + ' 次';
+    $('cg-edit-content').value = item.content || '';
+
+    var categoryOptions = Object.keys(state.labels.category).map(function (key) {
+      return { value: key, label: state.labels.category[key] };
+    });
+    fillSelect($('cg-edit-category'), categoryOptions, item.category);
+    var statusOptions = Object.keys(state.labels.status).map(function (key) {
+      return { value: key, label: state.labels.status[key] };
+    });
+    fillSelect($('cg-edit-status'), statusOptions, item.status);
+
+    var salience = Number(item.salience) || 0;
+    $('cg-edit-salience').value = String(salience);
+    $('cg-edit-salience-val').textContent = salience.toFixed(2);
+    $('cg-edit-modal').hidden = false;
+    // preventScroll 很关键：iframe 高度等于整页内容高度，默认的 focus() 会
+    // 把外层页面滚到输入框位置，看起来就是「页面被下拉一大段」。
+    $('cg-edit-content').focus({ preventScroll: true });
+  }
+
+  function closeEdit() {
+    $('cg-edit-modal').hidden = true;
+    state.editing = null;
+  }
+
+  function saveEdit() {
+    var item = state.editing;
+    if (!item) return;
+    var content = $('cg-edit-content').value.trim();
+    if (!content) { toast('内容不能为空', 'err'); return; }
+    if (content.length > MAX_CONTENT) { toast('内容超过 ' + MAX_CONTENT + ' 字，请先精简', 'err'); return; }
+    var args = {
+      item_id: item.id,
+      content: content,
+      category: $('cg-edit-category').value,
+      status: $('cg-edit-status').value,
+      salience: Number($('cg-edit-salience').value)
+    };
+    var button = $('cg-edit-save');
+    button.disabled = true;
+    M.action('update', args).then(function (res) {
+      button.disabled = false;
+      if (!res || res.ok !== true) { fail(res, '保存失败'); return; }
+      toast('已保存 #' + item.id, 'ok');
+      closeEdit();
+      loadItems();
+      loadStats();
+      loadSessions();
+    }).catch(function (err) {
+      button.disabled = false;
+      toast('保存失败：' + err, 'err');
+    });
+  }
+
+  function removeItem(item) {
+    M.action('delete', { item_id: item.id }).then(function (res) {
+      if (!res || res.ok !== true) { fail(res, '删除失败'); return; }
+      toast('已删除 #' + item.id, 'ok');
+      if (state.editing && state.editing.id === item.id) closeEdit();
+      loadItems();
+      loadStats();
+      loadSessions();
+    }).catch(function (err) { toast('删除失败：' + err, 'err'); });
+  }
+
+  // ── 新增 ──
+
+  function openCreate() {
+    if (!state.sessions.length) { toast('还没有任何会话，先让机器人在群里聊几轮', 'err'); return; }
+    var current = state.filters.session_id || state.sessions[0].session_id;
+    var options = state.sessions.map(function (item) {
+      return { value: item.session_id, label: item.label || item.session_id };
+    });
+    fillSelect($('cg-create-session'), options, current);
+    var categoryOptions = Object.keys(state.labels.category).map(function (key) {
+      return { value: key, label: state.labels.category[key] };
+    });
+    fillSelect($('cg-create-category'), categoryOptions, 'open_loop');
+    $('cg-create-content').value = '';
+    $('cg-create-salience').value = '0.6';
+    $('cg-create-salience-val').textContent = '0.60';
+    $('cg-create-modal').hidden = false;
+    // 同 openEdit：避免 focus() 把外层页面滚走。
+    $('cg-create-content').focus({ preventScroll: true });
+  }
+
+  function closeCreate() { $('cg-create-modal').hidden = true; }
+
+  function saveCreate() {
+    var content = $('cg-create-content').value.trim();
+    if (!content) { toast('内容不能为空', 'err'); return; }
+    if (content.length > MAX_CONTENT) { toast('内容超过 ' + MAX_CONTENT + ' 字，请先精简', 'err'); return; }
+    var args = {
+      session_id: $('cg-create-session').value,
+      category: $('cg-create-category').value,
+      content: content,
+      salience: Number($('cg-create-salience').value)
+    };
+    var button = $('cg-create-save');
+    button.disabled = true;
+    M.action('create', args).then(function (res) {
+      button.disabled = false;
+      if (!res || res.ok !== true) { fail(res, '新增失败'); return; }
+      toast('已新增记忆', 'ok');
+      closeCreate();
+      loadItems();
+      loadStats();
+      loadSessions();
+    }).catch(function (err) {
+      button.disabled = false;
+      toast('新增失败：' + err, 'err');
+    });
+  }
+
+  function purgeSession() {
+    var sessionId = state.filters.session_id;
+    if (!sessionId) return;
+    M.action('purge', { session_id: sessionId }).then(function (res) {
+      if (!res || res.ok !== true) { fail(res, '清空失败'); return; }
+      toast('已清空 ' + (res.removed || 0) + ' 条', 'ok');
+      state.offset = 0;
+      loadItems();
+      loadStats();
+      loadSessions();
+    }).catch(function (err) { toast('清空失败：' + err, 'err'); });
+  }
+
+  // ── 情绪 ──
+
+  function openMood() {
+    var mood = state.mood || {};
+    var values = mood.primitives || {};
+    var bases = mood.baselines || {};
+    PRIMITIVE_ORDER.concat(['eng']).forEach(function (name) {
+      var fallback = name === 'eng' ? 0.6 : Number(bases[name]);
+      if (isNaN(fallback)) fallback = 0.5;
+      var num = name === 'eng' ? Number(mood.energy) : Number(values[name]);
+      if (isNaN(num)) num = fallback;
+      $('cg-mood-in-' + name).value = String(num);
+      $('cg-mood-in-' + name + '-val').textContent = num.toFixed(2);
+    });
+    $('cg-mood-modal').hidden = false;
+    $('cg-mood-in-joy').focus({ preventScroll: true });
+  }
+
+  function closeMood() { $('cg-mood-modal').hidden = true; }
+
+  function saveMood() {
+    // 只提交八个基元 + 精力。valence/arousal 是派生量，提交上去也会被忽略
+    // （cg_webui.mem_mood_set 里明确写了这一点）。
+    var args = { energy: Number($('cg-mood-in-eng').value), reason: '手动调整' };
+    PRIMITIVE_ORDER.forEach(function (name) {
+      args[name] = Number($('cg-mood-in-' + name).value);
+    });
+    var button = $('cg-mood-save');
+    button.disabled = true;
+    M.action('mood_set', args).then(function (res) {
+      button.disabled = false;
+      if (!res || res.ok !== true) { fail(res, '调整失败'); return; }
+      toast('情绪已调整为「' + (res.label || '—') + '」', 'ok');
+      if (res.warning) toast(res.warning, 'err');
+      closeMood();
+      loadMood();
+    }).catch(function (err) {
+      button.disabled = false;
+      toast('调整失败：' + err, 'err');
+    });
+  }
+
+  function resetMood() {
+    M.action('mood_reset', {}).then(function (res) {
+      if (!res || res.ok !== true) { fail(res, '重置失败'); return; }
+      toast('已回到基线', 'ok');
+      loadMood();
+    }).catch(function (err) { toast('重置失败：' + err, 'err'); });
+  }
+
+  // ── 人物弹窗 ──
+  var editingPerson = null;
+
+  // ── 标签编辑器 ──
+  // 用户第 32 轮明确说过「无法修改或删除已有备注，只能新加」，所以标签改成
+  // 一份可增可删的列表，保存时**整份替换**（后端 mem_person_update 也是覆盖语义）。
+  // 标签的写法要求是「XX的XX」这种关系化说法，而不是画像式的具体描述。
+  var MAX_TAGS = 5;
+  var editingTags = [];
+  var newTags = [];
+
+  function renderTagList(boxId, tags) {
+    var box = $(boxId);
+    if (!box) return;
+    box.textContent = '';
+    if (!tags.length) {
+      box.appendChild(el('span', 'cg-tag-empty', '还没有标签'));
+      return;
+    }
+    tags.forEach(function (tag, index) {
+      var chip = el('span', 'cg-tag');
+      chip.appendChild(document.createTextNode(tag));
+      var x = el('button', 'cg-tag-x', '×');
+      x.type = 'button';
+      x.title = '删掉这条标签';
+      x.addEventListener('click', function () {
+        tags.splice(index, 1);
+        renderTagList(boxId, tags);
+      });
+      chip.appendChild(x);
+      box.appendChild(chip);
+    });
+  }
+
+  function addTag(boxId, tags, inputId) {
+    var input = $(inputId);
+    if (!input) return;
+    var text = input.value.trim().slice(0, 12);
+    if (!text) return;
+    if (tags.indexOf(text) >= 0) {
+      toast('这条标签已经有了', 'err');
+      input.value = '';
+      return;
+    }
+    if (tags.length >= MAX_TAGS) {
+      toast('最多 ' + MAX_TAGS + ' 条标签', 'err');
+      return;
+    }
+    tags.push(text);
+    input.value = '';
+    renderTagList(boxId, tags);
+  }
+
+  function sameTags(a, b) {
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  function openPerson(person) {
+    editingPerson = person;
+    editingTags = (person.tags || []).slice();
+    $('cg-person-in-name').value = person.display_name || '';
+    // 账号是只读的：它是 person_key 的一部分，改名改不动它。显示出来是为了
+    // 用户改称呼时能确认自己没改错人（同名不同号的情况真实存在）。
+    var accountTip = $('cg-person-in-account');
+    var account = accountText(person);
+    accountTip.textContent = account
+      ? '账号：' + account + '（改称呼不会改它，插件认人靠它）'
+      : '';
+    // 身份下拉跟着配置页走。自动判断出来的人不预选 —— 直接显示成手动设定
+    // 会把「插件猜的」变成「用户确认的」，等于悄悄改写了来源。
+    fillRoleOptions(
+      $('cg-person-in-role'),
+      person.is_manual ? (person.relation_role || '') : ''
+    );
+    var affection = Number(person.affection || 0);
+    $('cg-person-in-affection').value = String(affection);
+    $('cg-person-in-affection-val').textContent = affection.toFixed(0);
+    $('cg-person-level-hint').textContent = levelHint(affection);
+    // 六维滑杆按当前值填。它才是真相，好感度那一栏只读、由后端算。
+    renderAxisSliders($('cg-person-in-axes'), person.axes || {});
+    // 「跟随聊天」勾选：表示六维此刻是否交还自动流程。手调过的人默认不勾，
+    // 用户不动它就保持锁定 —— 这正是「我调的值不会再被改回去」。
+    $('cg-person-in-follow').checked = person.axes_source === 'auto';
+    $('cg-person-in-tag-new').value = '';
+    renderTagList('cg-person-in-tags', editingTags);
+    var titleName = person.display_name || person.user_id || '';
+    // 标题也带上账号，鼠标扫一眼就知道打开的是哪个人（同名的人会同时存在）。
+    var titleAccount = String(person.user_id || '').trim();
+    $('cg-person-title').textContent = (titleAccount && titleAccount !== titleName)
+      ? '编辑 ' + titleName + '（' + titleAccount + '）'
+      : '编辑 ' + titleName;
+    // 「忘掉」只对已存在的人有意义。
+    $('cg-person-del').disabled = false;
+    $('cg-person-modal').hidden = false;
+    $('cg-person-in-name').focus({ preventScroll: true });
+  }
+
+  function closePerson() {
+    $('cg-person-modal').hidden = true;
+    editingPerson = null;
+  }
+
+  function savePerson() {
+    if (!editingPerson) return;
+    var args = { person_key: editingPerson.person_key };
+    var name = $('cg-person-in-name').value.trim();
+    if (name && name !== editingPerson.display_name) args.display_name = name;
+    var role = $('cg-person-in-role').value;
+    if (role) args.relation_role = role;
+    // 六维整份发过去（后端按它重算好感度）。只有真的动了才发，
+    // 免得「只改了个名字」也把六维覆盖一遍。
+    var axes = collectAxisValues($('cg-person-in-axes'));
+    var before = editingPerson.axes || {};
+    var axesChanged = false;
+    Object.keys(axes).forEach(function (key) {
+      var oldValue = Number(before[key]);
+      if (isNaN(oldValue)) oldValue = axes[key];
+      if (Math.abs(oldValue - axes[key]) > 0.001) axesChanged = true;
+    });
+    if (axesChanged) args.axes = axes;
+    // 「跟随聊天」勾上而当前是锁定状态 → 显式放开闸门。注意这里**不**跟着
+    // axesChanged 一起发：改了数字就等于重新锁定，两者同时发会自相矛盾
+    // （后端也是 axes 优先）。
+    if (!axesChanged && $('cg-person-in-follow').checked && editingPerson.axes_source !== 'auto') {
+      args.follow_chat = true;
+    }
+    // 标签整份替换：只要和打开弹窗时不一样就发过去（清空成 [] 也算改动）。
+    if (!sameTags(editingTags, editingPerson.tags || [])) args.tags = editingTags.slice();
+
+    if (Object.keys(args).length === 1) { toast('没有改动', 'err'); return; }
+
+    var button = $('cg-person-save');
+    button.disabled = true;
+    M.action('person_update', args).then(function (res) {
+      button.disabled = false;
+      if (!res || res.ok !== true) { fail(res, '保存失败'); return; }
+      if (res.warning) toast(res.warning, 'err');
+      toast('已更新 ' + ((res.person && res.person.display_name) || '这个人'), 'ok');
+      closePerson();
+      loadPeople();
+    }).catch(function (err) {
+      button.disabled = false;
+      toast('保存失败：' + err, 'err');
+    });
+  }
+
+  function deletePerson() {
+    if (!editingPerson) return;
+    var label = editingPerson.display_name || editingPerson.user_id || '这个人';
+    M.action('person_delete', { person_key: editingPerson.person_key }).then(function (res) {
+      if (!res || res.ok !== true) { fail(res, '删除失败'); return; }
+      toast('已忘掉 ' + label, 'ok');
+      closePerson();
+      loadPeople();
+    }).catch(function (err) { toast('删除失败：' + err, 'err'); });
+  }
+
+  // ── 新增认识的人 ──
+  // 用户要求「只需要给『认识的人』增加一个『新增』功能，让用户自行写入即可」，
+  // 所以这里不读任何别的好感度插件，全凭手填。user_id 是唯一必填项 ——
+  // 没有它就没办法把「这个人」和聊天里出现的人对上。
+
+  function openPersonCreate() {
+    newTags = [];
+    $('cg-person-new-id').value = '';
+    $('cg-person-new-name').value = '';
+    $('cg-person-new-platform').value = '';
+    fillRoleOptions($('cg-person-new-role'), '');
+    $('cg-person-new-affection').value = '0';
+    $('cg-person-new-affection-val').textContent = '0';
+    $('cg-person-new-level-hint').textContent = levelHint(0);
+    // 新增时六维用各自的中性基线打底，用户想调就调。
+    var defaults = {};
+    AXIS_TABLE.forEach(function (axis) { defaults[axis.key] = Number(axis.default) || 0; });
+    renderAxisSliders($('cg-person-new-axes'), defaults);
+    $('cg-person-new-tag-new').value = '';
+    renderTagList('cg-person-new-tags', newTags);
+    $('cg-person-create-modal').hidden = false;
+    $('cg-person-new-id').focus({ preventScroll: true });
+  }
+
+  function closePersonCreate() {
+    $('cg-person-create-modal').hidden = true;
+  }
+
+  function savePersonCreate() {
+    var uid = $('cg-person-new-id').value.trim();
+    if (!uid) { toast('请填写对方的账号（QQ 号）', 'err'); $('cg-person-new-id').focus({ preventScroll: true }); return; }
+
+    var args = { user_id: uid };
+    var name = $('cg-person-new-name').value.trim();
+    if (name) args.display_name = name;
+    var platform = $('cg-person-new-platform').value.trim();
+    if (platform) args.platform = platform;
+    var role = $('cg-person-new-role').value;
+    if (role) args.relation_role = role;
+    // 六维：只有偏离基线才发（全基线等于「没说」，后端会用默认值）。
+    var axes = collectAxisValues($('cg-person-new-axes'));
+    var deviated = false;
+    Object.keys(axes).forEach(function (key) {
+      var base = 0;
+      for (var i = 0; i < AXIS_TABLE.length; i += 1) {
+        if (AXIS_TABLE[i].key === key) base = Number(AXIS_TABLE[i].default) || 0;
+      }
+      if (Math.abs(base - axes[key]) > 0.001) deviated = true;
+    });
+    if (deviated) args.axes = axes;
+    if (newTags.length) args.tags = newTags.slice();
+
+    var button = $('cg-person-new-save');
+    button.disabled = true;
+    M.action('person_create', args).then(function (res) {
+      button.disabled = false;
+      if (!res || res.ok !== true) { fail(res, '新增失败'); return; }
+      toast('已记住 ' + ((res.person && res.person.display_name) || uid), 'ok');
+      closePersonCreate();
+      loadPeople();
+    }).catch(function (err) {
+      button.disabled = false;
+      toast('新增失败：' + err, 'err');
+    });
+  }
+
+  // ── 喜好与厌恶 ──
+
+  var editingPref = null;
+
+  function renderPref(pref) {
+    var row = el('div', 'cg-pref ' + pref.kind);
+
+    row.appendChild(el('span', 'cg-badge kind-' + pref.kind,
+      pref.kind === 'like' ? '喜欢' : '讨厌'));
+    row.appendChild(el('span', 'cg-pref-topic', pref.topic));
+
+    var bar = el('div', 'cg-pref-bar');
+    var fill = el('i');
+    fill.style.width = (Math.max(0, Math.min(1, Number(pref.strength) || 0)) * 100).toFixed(1) + '%';
+    bar.appendChild(fill);
+    bar.title = '强度 ' + (Number(pref.strength) || 0).toFixed(2);
+    row.appendChild(bar);
+
+    var meta = el('span', 'cg-pref-meta');
+    meta.textContent = (Number(pref.strength) || 0).toFixed(2) + ' · ' + (pref.source_label || '未知');
+    if (pref.is_manual) meta.title = '你自己写的，自动观察不会改它';
+    row.appendChild(meta);
+
+    var act = el('span', 'cg-pref-act');
+    var editBtn = el('button', 'cg-btn sm', '编辑');
+    editBtn.type = 'button';
+    editBtn.addEventListener('click', function () { openPref(pref); });
+    act.appendChild(editBtn);
+    var delBtn = el('button', 'cg-btn sm danger', '删');
+    delBtn.type = 'button';
+    delBtn.addEventListener('click', function () { deletePref(pref); });
+    act.appendChild(delBtn);
+    row.appendChild(act);
+
+    return row;
+  }
+
+  function loadPrefs() {
+    var box = $('cg-prefs-list');
+    var empty = $('cg-prefs-empty');
+    var cap = $('cg-prefs-cap');
+    if (!box) return Promise.resolve();
+    return M.query('prefs', { limit: 200 }).then(function (res) {
+      if (!res || res.ok !== true) {
+        empty.textContent = '读取喜好失败：' + ((res && res.error) || '未知错误');
+        empty.hidden = false;
+        box.hidden = true;
+        return;
+      }
+      var prefs = res.prefs || [];
+      if (!prefs.length) {
+        empty.textContent = '还没有口味。等首次启动从人设提炼，或者点右上角「新增」自己写一条。';
+        empty.hidden = false;
+        box.hidden = true;
+        cap.textContent = '';
+        return;
+      }
+      box.textContent = '';
+      prefs.forEach(function (pref) { box.appendChild(renderPref(pref)); });
+      empty.hidden = true;
+      box.hidden = false;
+      var likes = prefs.filter(function (p) { return p.kind === 'like'; }).length;
+      var dislikes = prefs.length - likes;
+      cap.textContent = '喜欢 ' + likes + ' / 讨厌 ' + dislikes;
+    }).catch(function (err) {
+      empty.textContent = '读取喜好失败：' + err;
+      empty.hidden = false;
+      box.hidden = true;
+    });
+  }
+
+  function openPref(pref) {
+    editingPref = pref;
+    $('cg-pref-title').textContent = (pref.kind === 'like' ? '编辑喜欢' : '编辑讨厌') + '：' + pref.topic;
+    $('cg-pref-in-kind').value = pref.kind;
+    $('cg-pref-in-topic').value = pref.topic;
+    var strength = Number(pref.strength) || 0.5;
+    $('cg-pref-in-strength').value = strength;
+    $('cg-pref-in-strength-val').textContent = strength.toFixed(2);
+    $('cg-pref-modal').hidden = false;
+    $('cg-pref-in-topic').focus({ preventScroll: true });
+  }
+
+  function closePref() {
+    $('cg-pref-modal').hidden = true;
+    editingPref = null;
+  }
+
+  function savePref() {
+    if (!editingPref) return;
+    var args = { pref_key: editingPref.pref_key };
+    var topic = $('cg-pref-in-topic').value.trim();
+    if (topic && topic !== editingPref.topic) args.topic = topic;
+    var strength = Number($('cg-pref-in-strength').value);
+    if (!isNaN(strength) && Math.abs(strength - (Number(editingPref.strength) || 0)) > 0.001) {
+      args.strength = strength;
+    }
+    if (Object.keys(args).length === 1) { toast('没有改动', 'err'); return; }
+
+    var button = $('cg-pref-save');
+    button.disabled = true;
+    M.action('pref_update', args).then(function (res) {
+      button.disabled = false;
+      if (!res || res.ok !== true) { fail(res, '修改失败'); return; }
+      toast('已保存', 'ok');
+      closePref();
+      loadPrefs();
+    }).catch(function (err) {
+      button.disabled = false;
+      toast('修改失败：' + err, 'err');
+    });
+  }
+
+  function deletePref(pref) {
+    M.action('pref_delete', { pref_key: pref.pref_key }, true).then(function (res) {
+      if (!res || res.ok !== true) { fail(res, '删除失败'); return; }
+      toast('已删掉「' + pref.topic + '」', 'ok');
+      loadPrefs();
+    }).catch(function (err) { toast('删除失败：' + err, 'err'); });
+  }
+
+  function openPrefCreate() {
+    $('cg-pref-new-kind').value = 'like';
+    $('cg-pref-new-topic').value = '';
+    $('cg-pref-new-strength').value = 0.6;
+    $('cg-pref-new-strength-val').textContent = '0.60';
+    $('cg-pref-create-modal').hidden = false;
+    $('cg-pref-new-topic').focus({ preventScroll: true });
+  }
+
+  function closePrefCreate() {
+    $('cg-pref-create-modal').hidden = true;
+  }
+
+  function savePrefCreate() {
+    var topic = $('cg-pref-new-topic').value.trim();
+    if (!topic) { toast('请填写话题', 'err'); $('cg-pref-new-topic').focus({ preventScroll: true }); return; }
+    var args = {
+      kind: $('cg-pref-new-kind').value,
+      topic: topic,
+      strength: Number($('cg-pref-new-strength').value)
+    };
+    var button = $('cg-pref-new-save');
+    button.disabled = true;
+    M.action('pref_create', args).then(function (res) {
+      button.disabled = false;
+      if (!res || res.ok !== true) { fail(res, '新增失败'); return; }
+      toast('已记住这个口味', 'ok');
+      closePrefCreate();
+      loadPrefs();
+    }).catch(function (err) {
+      button.disabled = false;
+      toast('新增失败：' + err, 'err');
+    });
+  }
+
+  // ── 事件绑定 ──
+
+  // 注意：必须把 this 和参数转发给被延迟调用的函数。
+  // 早先的实现只写 setTimeout(fn, delay)，参数全丢——搜索框的回调里
+  // event 是 undefined，event.target.value 抛 TypeError 被吞掉，
+  // 表现为「搜索栏完全没反应」。这个坑对任何传参的事件回调都成立。
+  function debounce(fn, delay) {
+    var timer = null;
+    return function () {
+      var context = this;
+      var args = arguments;
+      clearTimeout(timer);
+      timer = setTimeout(function () { fn.apply(context, args); }, delay);
+    };
+  }
+
+  function reload() {
+    state.offset = 0;
+    loadItems();
+    loadStats();
+    loadSessions();
+  }
+
+  function bind() {
+    $('cg-refresh').addEventListener('click', function () { reload(); toast('已刷新'); });
+    $('cg-create').addEventListener('click', openCreate);
+    $('cg-purge').addEventListener('click', purgeSession);
+
+    $('cg-f-session').addEventListener('change', function (event) {
+      state.filters.session_id = event.target.value;
+      $('cg-purge').disabled = !state.filters.session_id;
+      state.offset = 0;
+      loadItems();
+    });
+    $('cg-f-status').addEventListener('change', function (event) {
+      state.filters.status = event.target.value;
+      state.offset = 0;
+      loadItems();
+    });
+    $('cg-f-category').addEventListener('change', function (event) {
+      state.filters.category = event.target.value;
+      state.offset = 0;
+      loadItems();
+    });
+    $('cg-f-limit').addEventListener('change', function (event) {
+      state.limit = parseInt(event.target.value, 10) || 50;
+      state.offset = 0;
+      loadItems();
+    });
+    $('cg-f-search').addEventListener('input', debounce(function () {
+      // 直接读输入框的当前值，不依赖事件对象：延迟执行时事件早已结束，
+      // 从元素取值既更直观也避免持有过期引用。
+      state.filters.search = $('cg-f-search').value.trim();
+      state.offset = 0;
+      loadItems();
+    }, 320));
+
+    $('cg-prev').addEventListener('click', function () {
+      if (state.offset <= 0) return;
+      state.offset = Math.max(0, state.offset - state.limit);
+      loadItems();
+    });
+    $('cg-next').addEventListener('click', function () {
+      if (state.offset + state.items.length >= state.total) return;
+      state.offset += state.limit;
+      loadItems();
+    });
+
+    $('cg-edit-save').addEventListener('click', saveEdit);
+    $('cg-edit-cancel').addEventListener('click', closeEdit);
+    $('cg-edit-delete').addEventListener('click', function () {
+      if (state.editing) removeItem(state.editing);
+    });
+    $('cg-edit-salience').addEventListener('input', function (event) {
+      $('cg-edit-salience-val').textContent = Number(event.target.value).toFixed(2);
+    });
+
+    $('cg-create-save').addEventListener('click', saveCreate);
+    $('cg-create-cancel').addEventListener('click', closeCreate);
+    $('cg-create-salience').addEventListener('input', function (event) {
+      $('cg-create-salience-val').textContent = Number(event.target.value).toFixed(2);
+    });
+
+    $('cg-mood-adjust').addEventListener('click', openMood);
+    $('cg-mood-reset').addEventListener('click', resetMood);
+    $('cg-mood-save').addEventListener('click', saveMood);
+    $('cg-mood-cancel').addEventListener('click', closeMood);
+    PRIMITIVE_ORDER.concat(['eng']).forEach(function (name) {
+      $('cg-mood-in-' + name).addEventListener('input', function (event) {
+        $('cg-mood-in-' + name + '-val').textContent = Number(event.target.value).toFixed(2);
+      });
+    });
+
+    $('cg-person-save').addEventListener('click', savePerson);
+    $('cg-person-del').addEventListener('click', deletePerson);
+    $('cg-person-cancel').addEventListener('click', closePerson);
+    $('cg-person-in-affection').addEventListener('input', function (event) {
+      var value = Number(event.target.value);
+      $('cg-person-in-affection-val').textContent = value.toFixed(0);
+      // 阈值可以在配置页改，所以这里实时算一次「现在会算成哪一档」。
+      $('cg-person-level-hint').textContent = levelHint(value);
+    });
+    // 标签：点「加」或按回车都行（回车是这里唯一的键盘快捷方式，
+    // 因为标签输入框里最自然的动作就是打完一条回车继续打）。
+    $('cg-person-in-tag-add').addEventListener('click', function () {
+      addTag('cg-person-in-tags', editingTags, 'cg-person-in-tag-new');
+    });
+    $('cg-person-in-tag-new').addEventListener('keydown', function (event) {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      addTag('cg-person-in-tags', editingTags, 'cg-person-in-tag-new');
+    });
+
+    $('cg-person-create').addEventListener('click', openPersonCreate);
+    $('cg-person-new-save').addEventListener('click', savePersonCreate);
+    $('cg-person-new-cancel').addEventListener('click', closePersonCreate);
+    $('cg-person-new-affection').addEventListener('input', function (event) {
+      var value = Number(event.target.value);
+      $('cg-person-new-affection-val').textContent = value.toFixed(0);
+      $('cg-person-new-level-hint').textContent = levelHint(value);
+    });
+    $('cg-person-new-tag-add').addEventListener('click', function () {
+      addTag('cg-person-new-tags', newTags, 'cg-person-new-tag-new');
+    });
+    $('cg-person-new-tag-new').addEventListener('keydown', function (event) {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      addTag('cg-person-new-tags', newTags, 'cg-person-new-tag-new');
+    });
+
+    // 喜好面板
+    $('cg-pref-create').addEventListener('click', openPrefCreate);
+    $('cg-pref-new-save').addEventListener('click', savePrefCreate);
+    $('cg-pref-new-cancel').addEventListener('click', closePrefCreate);
+    $('cg-pref-new-strength').addEventListener('input', function (event) {
+      $('cg-pref-new-strength-val').textContent = Number(event.target.value).toFixed(2);
+    });
+    $('cg-pref-save').addEventListener('click', savePref);
+    $('cg-pref-cancel').addEventListener('click', closePref);
+    $('cg-pref-in-strength').addEventListener('input', function (event) {
+      $('cg-pref-in-strength-val').textContent = Number(event.target.value).toFixed(2);
+    });
+
+    // Esc 关闭弹窗（宿主确认框走它自己的 UI，这里只处理本页弹窗）
+    document.addEventListener('keydown', function (event) {
+      if (event.key !== 'Escape') return;
+      if (!$('cg-edit-modal').hidden) closeEdit();
+      if (!$('cg-create-modal').hidden) closeCreate();
+      if (!$('cg-mood-modal').hidden) closeMood();
+      if (!$('cg-person-modal').hidden) closePerson();
+      if (!$('cg-person-create-modal').hidden) closePersonCreate();
+      if (!$('cg-pref-modal').hidden) closePref();
+      if (!$('cg-pref-create-modal').hidden) closePrefCreate();
+    });
+    // 点遮罩关闭。这里用查表而不是 if/else 链：之前最后一个分支写的是
+    // 「否则就 closeMood」，新加弹窗时会被它误关掉情绪弹窗。
+    var modalClosers = {
+      'cg-edit-modal': closeEdit,
+      'cg-create-modal': closeCreate,
+      'cg-mood-modal': closeMood,
+      'cg-person-modal': closePerson,
+      'cg-person-create-modal': closePersonCreate,
+      'cg-pref-modal': closePref,
+      'cg-pref-create-modal': closePrefCreate
+    };
+    Object.keys(modalClosers).forEach(function (id) {
+      $(id).addEventListener('click', function (event) {
+        if (event.target !== event.currentTarget) return;
+        modalClosers[id]();
+      });
+    });
+  }
+
+  function boot() {
+    if (!M || !M.ready) {
+      document.getElementById('cg-list').appendChild(
+        el('div', 'cg-empty', '无法连接宿主：window.maibot 未注入。请从 MaiBot 插件页面打开本页。')
+      );
+      return;
+    }
+    bind();
+    M.ready.then(function () {
+      return loadStats().then(loadSessions).then(function () {
+        // 用 stats 里的类别/状态标签填充筛选下拉
+        var categoryOptions = [{ value: '', label: '全部类别' }].concat(
+          Object.keys(state.labels.category).map(function (key) {
+            return { value: key, label: state.labels.category[key] };
+          })
+        );
+        fillSelect($('cg-f-category'), categoryOptions, '');
+        var statusOptions = [{ value: '', label: '全部状态' }].concat(
+          Object.keys(state.labels.status).map(function (key) {
+            return { value: key, label: state.labels.status[key] };
+          })
+        );
+        // 默认只看「活跃」。这张表按显著度降序排，而 resolved（已解决）和
+        // expired（已过期）里躺着不少高分历史条目，默认「全部状态」会让第一屏
+        // 全是已经结束的话题，反而看不到当前真正在用的记忆。
+        // 下拉框里仍可切回「全部状态」。
+        fillSelect($('cg-f-status'), statusOptions, DEFAULT_STATUS_FILTER);
+        state.filters.status = DEFAULT_STATUS_FILTER;
+        return loadMood().then(loadPeople).then(loadPrefs).then(loadItems);
+      });
+    }).catch(function (err) {
+      toast('初始化失败：' + err, 'err');
+    });
+  }
+
+  boot();
+})();
+</script>
