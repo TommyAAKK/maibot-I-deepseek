@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover - 仅用于脱离 Runner 的本地导入
 from .cg_person import DEFAULT_INTIMACY_LEVELS, DEFAULT_ROLES
 
 
-CONFIG_VERSION = "1.0.0"
+CONFIG_VERSION = "1.1.0"
 
 #: 本插件负责补全的五类情境记忆。顺序即注入时的展示顺序。
 ALL_CATEGORIES: tuple[str, ...] = (
@@ -549,6 +549,277 @@ class AbsenceConfig(PluginConfigBase):
         default="</companion-absence>",
         description="缺席提示的结束标记",
         json_schema_extra=_ui("结束标记", "与起始标记成对出现"),
+    )
+
+
+class PresenceConfig(PluginConfigBase):
+    """在场：区分「她不在」和「对方没来」。
+
+    原来的缺席感只算 ``now - last_seen``，**假设她一直醒着**。真机上这就翻车了：
+    用户每天 00:00 关机、11:00 开机，某天上午开机后她看到「73 小时没说话」，
+    第一句是「你怎么这么久没来」——可其中 33.8 小时是她自己不在。
+
+    这里从宿主 ``online_time`` 表读出她真正在线的时间，把间隔拆成两段：
+    「她不在」的那部分该说「我这几天没开机」，「她醒着但对方没来」的那部分
+    才该有缺席感。
+    """
+
+    __ui_label__ = "在场感知"
+    __ui_icon__ = "presence"
+    __ui_order__ = 33
+
+    enabled: bool = Field(
+        default=True,
+        description="是否区分「她不在」与「对方没来」",
+        json_schema_extra=_ui(
+            "区分她不在与对方没来",
+            "开启后读宿主的在线时段，把「多久没说话」拆成两段；关掉则退回旧算法"
+            "（一律按「对方没来」处理）",
+        ),
+    )
+    online_days: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=365.0,
+        description="往回读多少天的在线时段",
+        json_schema_extra=_ui(
+            "读多少天在线时段",
+            "宿主每 5 分钟写一行，30 天约 8600 行。读不到就当没有在线数据（退回旧算法）",
+        ),
+    )
+    offline_dominant: float = Field(
+        default=0.5,
+        ge=0.1,
+        le=0.9,
+        description="离线占比超过这个值就不算「被冷落」",
+        json_schema_extra=_ui(
+            "离线占比阈值",
+            "间隔里她不在的时间超过这个比例，就判成「我不在」而不是「你冷落我」",
+        ),
+    )
+    away_enabled: bool = Field(
+        default=True,
+        description="是否注入「那段时间我不在」的提示",
+        json_schema_extra=_ui(
+            "提「我不在」",
+            "关掉则只修正缺席感判断、不额外注入这句话",
+        ),
+    )
+
+
+class BackfillConfig(PluginConfigBase):
+    """历史补抓：把「她没看见的那几天」从 QQ 端捞回来。
+
+    宿主只在收到消息时写库，所以关机期间的消息**永久缺失**（真机实测：
+    ``online_time`` 的 8 段离线区间内 ``mai_messages`` 计数全为 0）。
+    而 QQ 客户端本地缓存里有——实测能往前翻 9~10 天。
+
+    只有群聊。私聊 ``get_friend_msg_history`` 返回空数组是「这几天没有私聊」，
+    **不是能力不可用**。
+    """
+
+    __ui_label__ = "历史补抓"
+    __ui_icon__ = "download"
+    __ui_order__ = 34
+
+    enabled: bool = Field(
+        default=True,
+        description="是否从 QQ 端补抓历史消息",
+        json_schema_extra=_ui(
+            "补抓历史消息",
+            "开启后遇到「有待补消息」时会向适配器要群历史。需要 manifest 声明 api.call",
+        ),
+    )
+    min_interval_minutes: int = Field(
+        default=30,
+        ge=1,
+        le=1440,
+        description="同一会话两次补抓的最小间隔（分钟）",
+        json_schema_extra=_ui(
+            "补抓间隔（分钟）",
+            "补的是「关机期间的洞」，不会天天有新洞，不需要每次抽取都补",
+        ),
+    )
+    max_age_days: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=30.0,
+        description="最多往回补多少天",
+        json_schema_extra=_ui(
+            "最多补多少天",
+            "适配器本地缓存上限约 9~10 天，设更大只会翻到空页",
+        ),
+    )
+    max_pages: int = Field(
+        default=40,
+        ge=1,
+        le=200,
+        description="最多翻多少页",
+        json_schema_extra=_ui("最多翻页数", "每页 100 条，40 页 ≈ 4000 条，远超 10 天实际量"),
+    )
+    max_messages: int = Field(
+        default=200,
+        ge=10,
+        le=2000,
+        description="单次补抓最多保留多少条",
+        json_schema_extra=_ui("单次保留上限", "补抓结果要和宿主库合并后一起抽取，太多会撑爆提示词"),
+    )
+
+
+class InitiativeConfig(PluginConfigBase):
+    """自主发言：让她自己决定这一轮要不要开口。
+
+    宿主的发言频率只管**触发**（攒够几条才让 Planner 跑），管不了「跑起来之后
+    要不要说」。而 ``focus_mode = true`` 时频率被硬编码成 1.0，阈值恒为 1 条、
+    空闲退避也失效——三重叠加的结果是「看到啥都要回」。
+
+    这里的做法是在 ``maisaka.planner.before_request`` 里**从工具清单里删掉
+    ``reply``**：模型不是「被劝别说」，是**没有说的手段**。
+    """
+
+    __ui_label__ = "自主发言"
+    __ui_icon__ = "speak"
+    __ui_order__ = 36
+
+    enabled: bool = Field(
+        default=False,
+        description="是否启用自主发言闸门",
+        json_schema_extra=_ui(
+            "启用自主发言闸门",
+            "开启后按兴趣、好感度、心情决定这一轮要不要开口。默认关——它改变的是"
+            "「她会说话吗」这件事，建议先观察日志再开",
+        ),
+    )
+    at_always_reply: bool = Field(
+        default=True,
+        description="被 @ 时一定回复，不看分数",
+        json_schema_extra=_ui(
+            "被 @ 一定回",
+            "对应宿主的 inevitable_at_reply。被叫名字还不应声，那不是性格，是坏了",
+        ),
+    )
+    mentioned_always_reply: bool = Field(
+        default=False,
+        description="被提到名字时也一定回复",
+        json_schema_extra=_ui(
+            "被提及一定回",
+            "对应宿主的 mentioned_bot_reply。默认关——群里提名字太常见了",
+        ),
+    )
+    threshold: float = Field(
+        default=0.45,
+        ge=0.0,
+        le=1.0,
+        description="软评分门槛，低于它就不开口",
+        json_schema_extra=_ui(
+            "开口门槛",
+            "兴趣 0.40 + 好感度 0.30 + 心情 0.20 + 精力 0.10 加权之后要过这条线。"
+            "0.45 大致是「三样里至少两样还行」",
+        ),
+    )
+    gate_send_emoji: bool = Field(
+        default=True,
+        description="拦掉时是否连同发表情包的权限一起收回",
+        json_schema_extra=_ui(
+            "连表情包一起拦",
+            "表情包也是发言。她要是「不想说话」却回了个表情，那就不叫不想说话",
+        ),
+    )
+    log_decisions: bool = Field(
+        default=True,
+        description="是否把每次判定结果写进日志",
+        json_schema_extra=_ui(
+            "记录判定原因",
+            "强烈建议开着。主动功能最难排查的就是「它为什么不说话」，"
+            "日志里要能直接看到原因和各项分数",
+        ),
+    )
+
+
+class HistoryConfig(PluginConfigBase):
+    """未读历史：她知道自己错过了什么，也能在被提起时翻回去看。
+
+    用户第 41 轮的原话：「正常人虽然会翻看历史消息，但仅限于几十条的程度，
+    对于 99+ 这种，一般不会从头看完……更远的就需要在别人明确提起时，bot 才会
+    一边说『我翻翻看哦』，一边回看这些消息。」
+
+    抽取窗口一直只有最后 ``capture.max_messages_per_extract`` 条，所以「全都
+    看完」从来不是真的。真问题是**补抓回来的其余部分被直接丢掉了**——她 digest
+    了回来后的一小时，然后像从头到尾都在场一样说话。这里把丢掉的部分记成
+    「洞」（条数 + 时间范围）和原文，让「那会儿我不在」这件事有据可依。
+    """
+
+    __ui_label__ = "未读历史"
+    __ui_icon__ = "history"
+    __ui_order__ = 37
+
+    enabled: bool = Field(
+        default=True,
+        description="是否记录「她没看见的那几段」",
+        json_schema_extra=_ui(
+            "记录未读历史",
+            "开启后抽取时会把窗口之外的未读消息记成一段洞（只有条数和时间，"
+            "不含内容），原文另存一份供需要时翻看",
+        ),
+    )
+    inject_unread: bool = Field(
+        default=True,
+        description="是否把「你有 N 条没看到」注入提示词",
+        json_schema_extra=_ui(
+            "提「没看到」",
+            "关掉则只记录不提醒。开着时她会知道「昨晚那 199 条我一条没赶上」，"
+            "于是只能说真话，不能假装看过",
+        ),
+    )
+    unread_max_chars: int = Field(
+        default=180,
+        ge=60,
+        le=600,
+        description="未读提示的字符上限",
+        json_schema_extra=_ui("未读提示字数", "只报条数和时间段，不需要很长"),
+    )
+    lookup_enabled: bool = Field(
+        default=True,
+        description="对方提到过去的事时，是否去翻聊天记录",
+        json_schema_extra=_ui(
+            "允许翻记录",
+            "对方说「昨天那个」「上次说的」时，翻出对得上的几条原文。"
+            "翻不到就如实说没翻到，而不是顺着上下文编",
+        ),
+    )
+    lookup_limit: int = Field(
+        default=3,
+        ge=1,
+        le=8,
+        description="一次最多翻出几条记录",
+        json_schema_extra=_ui("翻出几条", "再多就不是「翻翻看」，是「通读」了"),
+    )
+    lookup_similarity: float = Field(
+        default=0.34,
+        ge=0.1,
+        le=0.9,
+        description="翻记录时的相似度门槛",
+        json_schema_extra=_ui(
+            "翻记录门槛",
+            "消息比记忆长得多，所以比记忆那边的 0.40 低一点。太高会什么都翻不到",
+        ),
+    )
+    history_keep: int = Field(
+        default=1200,
+        ge=100,
+        le=20000,
+        description="每个会话最多保留多少条原文",
+        json_schema_extra=_ui(
+            "原文保留条数",
+            "只用于翻记录，不参与记忆衰减。更早的还能从连接器现捞",
+        ),
+    )
+    max_holes: int = Field(
+        default=40,
+        ge=4,
+        le=500,
+        description="每个会话最多保留几段洞",
+        json_schema_extra=_ui("最多保留几段洞", "太久以前的洞没有提的价值"),
     )
 
 
@@ -1377,6 +1648,26 @@ class CompanionGapConfig(PluginConfigBase):
         default_factory=BoundaryConfig,
         description="边界感",
         json_schema_extra=_ui("边界感"),
+    )
+    presence: PresenceConfig = Field(
+        default_factory=PresenceConfig,
+        description="在场感知",
+        json_schema_extra=_ui("在场感知"),
+    )
+    backfill: BackfillConfig = Field(
+        default_factory=BackfillConfig,
+        description="历史补抓",
+        json_schema_extra=_ui("历史补抓"),
+    )
+    initiative: InitiativeConfig = Field(
+        default_factory=InitiativeConfig,
+        description="自主发言",
+        json_schema_extra=_ui("自主发言"),
+    )
+    history: HistoryConfig = Field(
+        default_factory=HistoryConfig,
+        description="未读历史",
+        json_schema_extra=_ui("未读历史"),
     )
     debug: DebugConfig = Field(
         default_factory=DebugConfig,

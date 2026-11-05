@@ -21,7 +21,16 @@ from typing import Any, Callable
 
 from . import cg_log
 from .cg_avoidance import AvoidanceProbe
+from .cg_backfill import (
+    default_since,
+    describe_result,
+    fetch_friend_history,
+    fetch_group_history,
+    merge_messages,
+    should_backfill,
+)
 from .cg_extract import format_transcript, frame_self_lines, run_extraction
+from .cg_history import describe_span, split_window, summarize_hole, to_history_rows
 from .cg_person import (
     accumulate_impact,
     affection_from_axes,
@@ -56,6 +65,14 @@ SELF_ID_REFRESH_SECONDS = 6 * 3600.0
 #: 情绪历史保留条数上限。
 MOOD_LOG_KEEP = 2000
 
+#: 「最近被 @ / 被提到」的时间窗（秒）。
+#:
+#: 自主发言闸门用它判断「这一轮不许压」。取 180 秒是因为：宿主攒消息的
+#: 节奏（``talk_value = 0.25`` 时约 4 条一轮）通常在半分钟内，加上退避和
+#: 排队，一分钟左右；3 分钟足够覆盖「@ 之后这一轮」而不至于把很久以前的
+#: @ 也算进来。
+ATTENTION_WINDOW_SECONDS = 180.0
+
 
 @dataclass(slots=True)
 class DirtySession:
@@ -72,6 +89,15 @@ class DirtySession:
     first_pending_ts: float = 0.0
     last_seen_ts: float = 0.0
     last_attempt_ts: float = 0.0
+    #: 最近一条「@ 她」的消息到达时间。自主发言闸门用它判断「这一轮必须回」。
+    #:
+    #: 宿主把 @ 强制触发的状态藏在 ``runtime._forced_turn_*`` 里，没有任何
+    #: 能力能把它读出来，所以只能自己记。用时间戳而不是布尔标记：布尔标记
+    #: 一旦 Planner 那轮没跑起来（被退避挡了）就会永远挂着，导致之后某一轮
+    #: 莫名其妙被当成「被 @ 了」。
+    at_ts: float = 0.0
+    #: 最近一条「提到她名字」的消息到达时间，同上。
+    mentioned_ts: float = 0.0
 
 
 class SessionTracker:
@@ -159,6 +185,12 @@ class SessionTracker:
         entry.last_seen_ts = now
         entry.platform = str(message.get("platform") or entry.platform or "")
         entry.chat_type = "group" if is_group else "private"
+        # 记「这一轮有没有被点名」。宿主的强制触发状态（``_forced_turn_*``）
+        # 没有任何能力能读出来，自主发言闸门要知道「这轮不许压」只能自己记。
+        if bool(message.get("is_at")):
+            entry.at_ts = now
+        if bool(message.get("is_mentioned")):
+            entry.mentioned_ts = now
         if isinstance(group_info, dict):
             entry.group_id = str(group_info.get("group_id") or entry.group_id or "")
             entry.group_name = str(group_info.get("group_name") or entry.group_name or "")
@@ -168,6 +200,33 @@ class SessionTracker:
             entry.user_nickname = str(nickname or entry.user_nickname or "")
 
     # ── 后台任务 ──
+
+    def recent_attention(
+        self,
+        session_id: str,
+        *,
+        within: float = ATTENTION_WINDOW_SECONDS,
+        now: float | None = None,
+    ) -> tuple[bool, bool]:
+        """这个会话最近``within``秒内有没有被 @ / 被提到。
+
+        自主发言闸门用这个判断「这一轮不许压」。**用时间窗而不是一次性标记**：
+        标记一旦被设置就得有人负责清掉，而 Planner 那轮可能根本没跑起来
+        （被退避挡了、被 focus 槽位挡了），那样标记会一直挂着，后面某一轮
+        就会莫名其妙地被当成「被 @ 了」。
+
+        Returns:
+            ``(被@过, 被提到过)``。
+        """
+
+        entry = self._dirty.get(str(session_id or "").strip())
+        if entry is None:
+            return False, False
+        current = time.time() if now is None else float(now)
+        window = max(1.0, float(within))
+        at_recent = entry.at_ts > 0 and current - entry.at_ts <= window
+        mentioned_recent = entry.mentioned_ts > 0 and current - entry.mentioned_ts <= window
+        return at_recent, mentioned_recent
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -435,13 +494,44 @@ class SessionTracker:
         recent_limit = max(1, int(getattr(capture, "recent_limit", 60) or 60))
         recent_hours = max(0.1, float(getattr(capture, "recent_hours", 12.0) or 12.0))
         messages = await self._fetch_recent(entry.session_id, recent_hours, recent_limit)
+
+        # 补抓关机期间的历史。宿主只在收到消息那一刻写库，所以她那几天不在的
+        # 聊天根本没进库（真机实测：8 段离线区间内消息数全为 0）。QQ 客户端
+        # 本地缓存里有，实测能往前翻 9~10 天。
+        #
+        # 只在「宿主库里的消息不够」时补：补抓要走一次 WebSocket 往返，
+        # 而且补回来的东西和已有的要按 message_id 去重合并——不是免费的。
+        backfilled = await self._backfill(entry, host_messages=messages)
+        if backfilled:
+            messages = merge_messages(messages, backfilled)
+
         if not messages:
             entry.pending = 0
             entry.first_pending_ts = 0.0
             return
 
         max_msgs = max(1, int(getattr(capture, "max_messages_per_extract", 30) or 30))
-        window = messages[-max_msgs:]
+
+        # 把「她要读的那 30 条」和「她错过的那些」拆开。
+        #
+        # 用户第 41 轮的原话：「正常人虽然会翻看历史消息，但仅限于几十条的程度，
+        # 对于 99+ 这种，一般不会从头看完。而 bot 现在抓取会直接全都看完，就失去
+        # 了离线的感觉，反而会产生一种『我一直看着，但我不说话』的监控感。」
+        #
+        # 事实是她从来没「全都看完」——`window` 一直是最后 30 条。真正的问题在
+        # 补抓那条路上：补回来的 200 条里，前 170 条**被直接丢掉了**，于是她用完
+        # 最后 30 条之后，像从头到尾都在场一样说话。既不是监控感，也不是如实缺席，
+        # 而是最糟的第三种：假装没缺过席。
+        #
+        # 现在把剩下的部分记成「洞」（只存条数和时间范围，不存内容）+ 原文入库
+        # （供她被人明确提起时翻看）。她因此知道自己错过了什么，也只能诚实地说
+        # 「那会儿我不在」。
+        _state = self._store.get_state(entry.session_id) or {}
+        _last_extract = float(_state.get("last_extract_ts") or 0.0)
+        window, hole = split_window(messages, max_msgs, since_ts=_last_extract)
+        if hole:
+            await self._record_hole(entry, hole)
+
         max_chars = int(getattr(capture, "max_session_chars", 6000) or 6000)
         transcript = format_transcript(window, max_chars=max_chars)
         # 把「她自己说的那几行」标成「你」。
@@ -1154,6 +1244,149 @@ class SessionTracker:
 
         return messages
 
+    async def _backfill(
+        self,
+        entry: DirtySession,
+        *,
+        host_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """从 QQ 端补抓她没看见的那段历史；返回补到的消息（可能为空）。
+
+        三个设计要点：
+
+        - **只在「宿主库里的消息装不满"最近一段"」时才补。** 判据是
+          「最早那条宿主消息是不是比上次抽取时间还靠后」——如果宿主库已经
+          覆盖到上次抽取，中间没有洞，补了也是重复。
+        - **空数组不是失败。** 用户原话：「私聊应该不是拿不到，而是这几天并没有
+          私聊。」``get_friend_msg_history`` 返回 ``[]`` 就是「没有新消息」。
+        - **按会话节流。** 补的是「关机期间的洞」，不会天天有新洞，
+          每次抽取都补一遍纯属浪费一次 WebSocket 往返。
+        """
+
+        config = self._config()
+        backfill_cfg = getattr(config, "backfill", None)
+        if backfill_cfg is None or not bool(getattr(backfill_cfg, "enabled", False)):
+            return []
+
+        state = None
+        try:
+            state = self._store.get_state(entry.session_id)
+        except Exception as exc:  # noqa: BLE001 - 读不到状态就不补
+            self._debug(f"补抓读取会话状态失败: {exc!r}")
+        last_extract = float((state or {}).get("last_extract_ts") or 0.0)
+
+        # 节流：同一个会话隔一段时间才补一次。
+        meta_key = f"backfill_at:{entry.session_id}"
+        try:
+            raw_last = self._store.get_meta(meta_key)
+            last_backfill = float(raw_last) if raw_last else 0.0
+        except Exception:  # noqa: BLE001
+            last_backfill = 0.0
+        interval = max(1, int(getattr(backfill_cfg, "min_interval_minutes", 30) or 30)) * 60.0
+        if not should_backfill(last_backfill_ts=last_backfill, min_interval=interval):
+            return []
+
+        # 宿主库已经覆盖到上次抽取时间 → 中间没有洞，不用补。
+        if host_messages and last_extract > 0:
+            stamps = [_as_float(item.get("timestamp")) for item in host_messages]
+            stamps = [value for value in stamps if value > 0]
+            if stamps and min(stamps) <= last_extract:
+                self._debug(f"会话 {entry.session_id} 宿主消息已覆盖上次抽取，跳过补抓")
+                return []
+
+        since_ts = default_since(
+            last_extract_ts=last_extract,
+            max_age_days=float(getattr(backfill_cfg, "max_age_days", 10.0) or 10.0),
+        )
+        max_pages = max(1, int(getattr(backfill_cfg, "max_pages", 40) or 40))
+        max_messages = max(10, int(getattr(backfill_cfg, "max_messages", 200) or 200))
+        chat_type = str(entry.chat_type or "").strip().lower()
+
+        try:
+            if chat_type == "group" and entry.group_id:
+                result = await fetch_group_history(
+                    self._ctx,
+                    group_id=entry.group_id,
+                    session_id=entry.session_id,
+                    group_name=entry.group_name,
+                    since_ts=since_ts,
+                    platform=entry.platform or "qq",
+                    max_pages=max_pages,
+                    logger=self._logger,
+                )
+            elif chat_type == "private" and entry.user_id:
+                result = await fetch_friend_history(
+                    self._ctx,
+                    user_id=entry.user_id,
+                    session_id=entry.session_id,
+                    since_ts=since_ts,
+                    platform=entry.platform or "qq",
+                    max_pages=max_pages,
+                    logger=self._logger,
+                )
+            else:
+                return []
+        except Exception as exc:  # noqa: BLE001 - 补抓失败绝不能影响正常抽取
+            self._warn(f"会话 {entry.session_id} 补抓历史失败（不影响抽取）: {exc!r}")
+            return []
+
+        # 无论成功失败都记时间：失败也代表「刚试过」，不该马上重试。
+        try:
+            self._store.set_meta(meta_key, str(time.time()))
+        except Exception:  # noqa: BLE001
+            pass
+
+        self._info(f"会话 {entry.session_id} 补抓历史：{describe_result(result)}")
+        if not result.ok or not result.messages:
+            # 空列表 = 这几天没有新消息，不是错误。**不要据此关闭功能。**
+            return []
+
+        messages = result.messages
+        if len(messages) > max_messages:
+            # 保留最近的：补回来的是为了抽取，越近越有用。
+            messages = messages[-max_messages:]
+        return messages
+
+    async def _record_hole(self, entry: DirtySession, hole: list[dict[str, Any]]) -> None:
+        """把「她没读到的那一段」记成洞，原文另存一份备用。
+
+        为什么要分成两张表：
+
+        - 洞（``gap_unread``）只存**条数和时间范围**，不存内容。她凭它知道自己
+          错过了什么，也只能诚实地说「那会儿我不在」。一旦把内容塞进去，她就
+          变成「其实全都看过」，那正是用户嫌弃的那种假装。
+        - 原文（``gap_history``）留着，只在她被人明确提起时才翻。``gap_items``
+          不能拿来干这个：那边会衰减、遗忘、按相似度合并，而聊天记录是事实。
+
+        全程 best-effort：记洞失败绝不能影响正常抽取。
+        """
+
+        summary = summarize_hole(hole)
+        if summary is None:
+            self._debug(f"会话 {entry.session_id} 有 {len(hole)} 条未读，但拿不到时间戳，跳过记洞")
+            return
+
+        try:
+            self._store.record_unread(
+                entry.session_id,
+                start_ts=summary["start_ts"],
+                end_ts=summary["end_ts"],
+                count=summary["count"],
+            )
+            rows = to_history_rows(hole)
+            added = self._store.add_history_rows(entry.session_id, rows) if rows else 0
+            self._store.prune_unread(entry.session_id)
+            self._store.trim_history(entry.session_id)
+        except Exception as exc:  # noqa: BLE001 - 记洞失败不影响抽取
+            self._warn(f"会话 {entry.session_id} 记录未读历史失败（不影响抽取）: {exc!r}")
+            return
+
+        self._debug(
+            f"会话 {entry.session_id} 记下未读：{summary['count']} 条"
+            f"（{describe_span(summary['start_ts'], summary['end_ts'])}），"
+            f"原文入库 {added} 条"
+        )
+
     # ── 日志 ──
 
     def _info(self, message: str) -> None:
@@ -1164,6 +1397,18 @@ class SessionTracker:
 
     def _warn(self, message: str) -> None:
         _log(self._logger, "warning", message)
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """把消息里的 ``timestamp``（宿主给字符串、适配器给数字）统一成 float。"""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:  # NaN
+        return default
+    return number
 
 
 def _is_empty_response_failure(result: Any) -> bool:

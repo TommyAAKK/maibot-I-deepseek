@@ -261,6 +261,56 @@ _DDL = (
     """
     CREATE INDEX IF NOT EXISTS idx_gap_prefs_updated ON gap_prefs (updated_at)
     """,
+    # ── 未读历史：她错过的那几段 ──
+    #
+    # 用户第 41 轮的原话：「正常人虽然会翻看历史消息，但仅限于几十条的程度，
+    # 对于 99+ 这种，一般不会从头看完……更远的就需要在别人明确提起时，bot 才会
+    # 一边说『我翻翻看哦』，一边回看这些消息。」
+    #
+    # gap_unread 只存**一行计数**：某段时间有几条、从几点到几点。它不存内容，
+    # 所以「她知道自己错过了什么」这件事，不会顺带变成「她其实全都看过」。
+    # 这是整件事的关键取舍——给了内容，她就没法诚实地说「那会儿我不在」。
+    """
+    CREATE TABLE IF NOT EXISTS gap_unread (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id  TEXT NOT NULL,
+        start_ts    REAL NOT NULL DEFAULT 0,
+        end_ts      REAL NOT NULL DEFAULT 0,
+        count       INTEGER NOT NULL DEFAULT 0,
+        status      TEXT NOT NULL DEFAULT 'new',
+        noticed_at  REAL NOT NULL DEFAULT 0,
+        used_at     REAL NOT NULL DEFAULT 0,
+        created_at  REAL NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_gap_unread_session
+        ON gap_unread (session_id, status, end_ts)
+    """,
+    # gap_history 才存原文，只在 L2「明确提起 → 翻看」时被检索。
+    # 和 gap_items 分开是因为生命周期完全不同：记忆会被衰减、遗忘、去重合并，
+    # 而聊天记录是**事实**——它不该被淡忘，只该被新记录挤出去。
+    """
+    CREATE TABLE IF NOT EXISTS gap_history (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id  TEXT NOT NULL,
+        message_id  TEXT NOT NULL DEFAULT '',
+        ts          REAL NOT NULL DEFAULT 0,
+        speaker     TEXT NOT NULL DEFAULT '',
+        user_id     TEXT NOT NULL DEFAULT '',
+        text        TEXT NOT NULL DEFAULT '',
+        looked_at   REAL NOT NULL DEFAULT 0,
+        created_at  REAL NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_gap_history_unique
+        ON gap_history (session_id, message_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_gap_history_session
+        ON gap_history (session_id, ts)
+    """,
 )
 
 _ITEM_COLUMNS = (
@@ -542,6 +592,19 @@ class GapStore:
 
         self.conn.execute("DELETE FROM gap_meta WHERE key = ?", (str(key),))
         self.conn.commit()
+
+    def get_meta(self, key: str) -> str | None:
+        """读一条键值元数据；不存在时返回 ``None``。
+
+        和 :meth:`meta_prefix` 的区别是它是点查——单个键的读取（比如「上次
+        补抓时间」）不该走 ``LIKE`` 扫描整张表。
+        """
+
+        row = self.conn.execute(
+            "SELECT value FROM gap_meta WHERE key = ?",
+            (str(key),),
+        ).fetchone()
+        return str(row["value"]) if row is not None else None
 
     def meta_prefix(self, prefix: str) -> dict[str, str]:
         """取出所有以 ``prefix`` 开头的键值，用于批量恢复（如记录过的发言频率原值）。"""
@@ -2067,5 +2130,296 @@ class GapStore:
         )
         self.conn.commit()
         return int(cursor.rowcount)
+
+    # ── 未读历史（L1 洞计数 / L2 原文回看）──
+    #
+    # 两张表分工严格，不要合并：
+    #   gap_unread  —— 只有「哪段时间、多少条」，**不含内容**。她的自我认知
+    #                  「那会儿我不在」全靠这张表，所以它必须保持"没有内容"。
+    #   gap_history —— 原文。只在对方明确提起、需要翻记录时才被查询。
+    #
+    # 为什么不像记忆那样衰减：聊天记录是事实。记忆会淡忘（因为她记不住），
+    # 但「昨晚群里确实聊了 199 条」不会因为她没看就变少。挤掉它的只能是新记录。
+
+    def _unread_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "session_id": str(row["session_id"]),
+            "start_ts": float(row["start_ts"] or 0.0),
+            "end_ts": float(row["end_ts"] or 0.0),
+            "count": int(row["count"] or 0),
+            "status": str(row["status"] or "new"),
+            "noticed_at": float(row["noticed_at"] or 0.0),
+            "used_at": float(row["used_at"] or 0.0),
+            "created_at": float(row["created_at"] or 0.0),
+        }
+
+    def record_unread(
+        self,
+        session_id: str,
+        *,
+        start_ts: float,
+        end_ts: float,
+        count: int,
+        now: float | None = None,
+        merge_slack: float = 600.0,
+    ) -> int:
+        """记一段「她没看见的消息」。
+
+        同一段时间被重复报两次不会产生两行：起止都在 ``merge_slack`` 内就合并，
+        条数取较大的那个（两次读到的原始范围可能不一样，大的更接近真相）。
+        """
+
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise ValueError("record_unread 需要 session_id")
+        total = max(0, int(count))
+        if total <= 0:
+            return 0
+        start = max(0.0, float(start_ts))
+        end = max(0.0, float(end_ts))
+        if end < start:
+            start, end = end, start
+        current = time.time() if now is None else float(now)
+        slack = max(0.0, float(merge_slack))
+
+        existing = self.conn.execute(
+            "SELECT * FROM gap_unread WHERE session_id = ? AND status = 'new' "
+            "ORDER BY end_ts DESC LIMIT 8",
+            (sid,),
+        ).fetchall()
+        for row in existing:
+            same_start = abs(float(row["start_ts"] or 0.0) - start) <= slack
+            same_end = abs(float(row["end_ts"] or 0.0) - end) <= slack
+            if same_start and same_end:
+                merged = max(int(row["count"] or 0), total)
+                self.conn.execute(
+                    "UPDATE gap_unread SET count = ?, noticed_at = ? WHERE id = ?",
+                    (merged, current, int(row["id"])),
+                )
+                self.conn.commit()
+                return int(row["id"])
+
+        cursor = self.conn.execute(
+            "INSERT INTO gap_unread "
+            "(session_id, start_ts, end_ts, count, status, noticed_at, used_at, created_at) "
+            "VALUES (?, ?, ?, ?, 'new', ?, 0, ?)",
+            (sid, start, end, total, current, current),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def list_unread(
+        self,
+        session_id: str,
+        *,
+        limit: int = 4,
+        since_ts: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        """返回还没被她「意识到」的洞，最新的在前。"""
+
+        sid = str(session_id or "").strip()
+        if not sid:
+            return []
+        sql = (
+            "SELECT * FROM gap_unread WHERE session_id = ? AND status = 'new' "
+            "AND end_ts > ? ORDER BY end_ts DESC LIMIT ?"
+        )
+        rows = self.conn.execute(
+            sql, (sid, max(0.0, float(since_ts)), max(1, int(limit)))
+        ).fetchall()
+        return [self._unread_row(row) for row in rows]
+
+    def mark_unread_used(self, ids: list[int], *, now: float | None = None) -> int:
+        """把洞标成「已经跟她讲过了」。
+
+        不删：她讲过一次之后，同一段时间再被提起时不必重复讲；但统计上还得
+        知道「她错过过多少」，WebUI 也要能看到。
+        """
+
+        keys = [int(i) for i in ids if int(i) > 0]
+        if not keys:
+            return 0
+        current = time.time() if now is None else float(now)
+        placeholders = ", ".join("?" for _ in keys)
+        cursor = self.conn.execute(
+            f"UPDATE gap_unread SET status = 'seen', used_at = ? "
+            f"WHERE id IN ({placeholders})",
+            [current, *keys],
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
+
+    def prune_unread(self, session_id: str, *, keep: int = 40) -> int:
+        """每个会话只留最近的若干个洞。"""
+
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0
+        total = self.conn.execute(
+            "SELECT COUNT(*) FROM gap_unread WHERE session_id = ?", (sid,)
+        ).fetchone()[0]
+        excess = int(total) - max(0, int(keep))
+        if excess <= 0:
+            return 0
+        cursor = self.conn.execute(
+            "DELETE FROM gap_unread WHERE id IN ("
+            "SELECT id FROM gap_unread WHERE session_id = ? "
+            "ORDER BY end_ts ASC LIMIT ?)",
+            (sid, excess),
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
+
+    def unread_stats(self, session_id: str) -> dict[str, int]:
+        """给她自己看的两个数：一共错过了多少条、分几段。"""
+
+        sid = str(session_id or "").strip()
+        if not sid:
+            return {"holes": 0, "messages": 0}
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS holes, COALESCE(SUM(count), 0) AS messages "
+            "FROM gap_unread WHERE session_id = ?",
+            (sid,),
+        ).fetchone()
+        return {"holes": int(row["holes"] or 0), "messages": int(row["messages"] or 0)}
+
+    def _history_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "session_id": str(row["session_id"]),
+            "message_id": str(row["message_id"] or ""),
+            "ts": float(row["ts"] or 0.0),
+            "speaker": str(row["speaker"] or ""),
+            "user_id": str(row["user_id"] or ""),
+            "text": str(row["text"] or ""),
+            "looked_at": float(row["looked_at"] or 0.0),
+            "created_at": float(row["created_at"] or 0.0),
+        }
+
+    def add_history_rows(
+        self,
+        session_id: str,
+        rows: list[dict[str, Any]],
+        *,
+        now: float | None = None,
+    ) -> int:
+        """把一段洞的原文入库。
+
+        靠 ``(session_id, message_id)`` 唯一索引做幂等：同一批消息被补抓两次
+        不会变成两份。
+        """
+
+        sid = str(session_id or "").strip()
+        if not sid or not rows:
+            return 0
+        current = time.time() if now is None else float(now)
+        payload: list[tuple[Any, ...]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("text") or "").strip()
+            if not text:
+                continue
+            payload.append(
+                (
+                    sid,
+                    str(row.get("message_id") or ""),
+                    float(row.get("ts") or 0.0),
+                    str(row.get("speaker") or ""),
+                    str(row.get("user_id") or ""),
+                    text,
+                    current,
+                )
+            )
+        if not payload:
+            return 0
+        before = self.conn.total_changes
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO gap_history "
+            "(session_id, message_id, ts, speaker, user_id, text, looked_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+            payload,
+        )
+        self.conn.commit()
+        return int(self.conn.total_changes - before)
+
+    def search_history(
+        self,
+        session_id: str,
+        *,
+        since_ts: float = 0.0,
+        until_ts: float = 0.0,
+        limit: int = 400,
+    ) -> list[dict[str, Any]]:
+        """取最近的若干条原文供 L2 检索。
+
+        为什么在 Python 侧做相似度而不是 SQL：``recall_score`` 是字符二元组
+        算法，SQLite 里没有等价物。400 条文本的比对是毫秒级，值得。
+        """
+
+        sid = str(session_id or "").strip()
+        if not sid:
+            return []
+        sql = "SELECT * FROM gap_history WHERE session_id = ? AND ts >= ?"
+        params: list[Any] = [sid, max(0.0, float(since_ts))]
+        if until_ts > 0:
+            sql += " AND ts <= ?"
+            params.append(float(until_ts))
+        sql += " ORDER BY ts DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        rows = self.conn.execute(sql, tuple(params)).fetchall()
+        items = [self._history_row(row) for row in rows]
+        items.sort(key=lambda item: item["ts"])
+        return items
+
+    def mark_history_looked(self, ids: list[int], *, now: float | None = None) -> int:
+        keys = [int(i) for i in ids if int(i) > 0]
+        if not keys:
+            return 0
+        current = time.time() if now is None else float(now)
+        placeholders = ", ".join("?" for _ in keys)
+        cursor = self.conn.execute(
+            f"UPDATE gap_history SET looked_at = ? WHERE id IN ({placeholders})",
+            [current, *keys],
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
+
+    def trim_history(self, session_id: str, *, keep: int = 1200) -> int:
+        """每个会话最多留这么多条原文。
+
+        1200 条 ≈ 十来个活跃群的一天半。再多也没用——真要翻更早的，连接器那
+        边还能现捞。
+        """
+
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0
+        total = self.conn.execute(
+            "SELECT COUNT(*) FROM gap_history WHERE session_id = ?", (sid,)
+        ).fetchone()[0]
+        excess = int(total) - max(0, int(keep))
+        if excess <= 0:
+            return 0
+        cursor = self.conn.execute(
+            "DELETE FROM gap_history WHERE id IN ("
+            "SELECT id FROM gap_history WHERE session_id = ? ORDER BY ts ASC LIMIT ?)",
+            (sid, excess),
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
+
+    def history_stats(self, session_id: str) -> dict[str, int]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return {"rows": 0, "looked": 0}
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS rows, "
+            "COALESCE(SUM(CASE WHEN looked_at > 0 THEN 1 ELSE 0 END), 0) AS looked "
+            "FROM gap_history WHERE session_id = ?",
+            (sid,),
+        ).fetchone()
+        return {"rows": int(row["rows"] or 0), "looked": int(row["looked"] or 0)}
 
 

@@ -128,6 +128,8 @@ def _check_capability_authorization() -> None:
         "ctx.frequency.get_adjust": "frequency.get_adjust",
         "ctx.frequency.set_adjust": "frequency.set_adjust",
         "ctx.maisaka.proactive.trigger": "maisaka.proactive.trigger",
+        "call_capability('database.query')": "database.query",
+        "ctx.api.call": "api.call",
     }
     for where, capability in used.items():
         allowed, reason = auth.check_capability(plugin_id, capability)
@@ -548,6 +550,10 @@ def main() -> int:
         "prefs",
         "absence",
         "boundary",
+        "presence",
+        "backfill",
+        "initiative",
+        "history",
         "debug",
     ):
         check(expected in sections, f"schema 含 {expected} 节")
@@ -569,7 +575,7 @@ def main() -> int:
                 plain_labels.append(f"[{section_name}].{field_name}={label!r}")
             if not hint or not _has_cjk(hint):
                 plain_hints.append(f"[{section_name}].{field_name}={hint!r}")
-    check(field_total == 145, f"schema 共 145 个配置项（实际 {field_total}）")
+    check(field_total == 168, f"schema 共 168 个配置项（实际 {field_total}）")
     check(not plain_labels, f"每个配置项的 label 都是中文（问题项 {plain_labels}）")
     check(not plain_hints, f"每个配置项的 hint 都是中文（问题项 {plain_hints}）")
 
@@ -625,9 +631,11 @@ def main() -> int:
     )
     check(manifest["manifest_version"] == 2, "manifest_version 2")
     caps = set(manifest.get("capabilities") or [])
-    # 这六项是代码里真的会调到的，一项都不能少：宿主按 manifest 签发能力令牌，
+    # 这八项是代码里真的会调到的，一项都不能少：宿主按 manifest 签发能力令牌，
     # 没声明的那项会被 capability_service 直接回 E_CAPABILITY_DENIED。
     # 早期只声明了前三项，精力门控和告别语因此是「写了但调不通」。
+    # 后来加「在场感知」用了 database.query、加「历史补抓」用了 api.call，
+    # 两处都是先写代码后补声明，于是同样的坑又踩了一次（见 README 已知限制）。
     for need in (
         "config.get",
         "message.get_recent",
@@ -635,6 +643,8 @@ def main() -> int:
         "frequency.get_adjust",
         "frequency.set_adjust",
         "maisaka.proactive.trigger",
+        "database.query",
+        "api.call",
     ):
         check(need in caps, f"capabilities 声明 {need}")
     check("host_application" in manifest and "sdk" in manifest, "manifest 含双版本区间")

@@ -161,6 +161,28 @@
   .cg-panel-cap { color: var(--cg-muted); font-size: 12.5px; flex: 1 1 auto; min-width: 80px; }
   .cg-panel-act { display: flex; gap: 8px; margin-left: auto; }
 
+  /* 可折叠面板。
+     认识的人有十三张卡片、喜好有二十条，全摊开会让页面长到必须滚很久才能
+     看到下面的记忆模块 —— 而记忆才是这个页面最常看的东西。折起来只留标题行
+     （标题行右侧本来就写着「共 N 人」「喜欢 16 / 讨厌 4」，不展开也知道个大概）。
+     折叠状态不写 localStorage：这是查看用的页面，每次打开都该是「整洁的默认态」，
+     上次碰过哪块不该影响这次。 */
+  .cg-fold-hit {
+    display: inline-flex; align-items: center; gap: 6px;
+    border: none; background: none; padding: 0; cursor: pointer;
+    color: var(--cg-fg); font: inherit; text-align: left;
+  }
+  .cg-fold-hit:focus-visible { outline: 2px solid var(--cg-accent); outline-offset: 3px; border-radius: 4px; }
+  .cg-fold-caret {
+    display: inline-block; width: 10px; font-size: 10px; line-height: 1;
+    color: var(--cg-muted); transition: transform .18s;
+    /* 用字符而不是 SVG：宿主会改写页面里的部分内联资源，纯文本最稳。 */
+  }
+  .cg-fold-caret::before { content: '\25B8'; }        /* ▸ */
+  .cg-panel:not(.folded) .cg-fold-caret { transform: rotate(90deg); }
+  .cg-panel.folded .cg-panel-body { display: none; }
+  .cg-panel.folded .cg-panel-act { display: none; }
+
   /* 情绪面板 */
   .cg-mood-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .cg-mood-label { font-size: 15px; font-weight: 700; color: var(--cg-fg); }
@@ -306,6 +328,32 @@
   .cg-axis-row .cg-axis-hint { flex: 1 1 100%; font-size: 11px; color: var(--cg-muted); margin: -4px 0 0 85px; }
   /* 喜好面板：和「认识的人」并列，但内容是「关于她自己」的。
      喜欢用暖色、讨厌用冷色，扫一眼就能分出两堆。 */
+  /* 喜欢 / 讨厌 用分段按钮切换，不做左右分栏。
+     理由是数据本身就偏：实测 16 条喜欢、4 条讨厌。分栏之后右栏基本是空的，
+     而每条要有「话题 + 强度条 + 来源 + 两个按钮」，半屏宽度下必然折行。
+     分段按钮把整行宽度留给当前这一类，同时在按钮上带出两边的条数 ——
+     不点开也知道对面有 4 条，不缺「一眼看全」的信息。 */
+  .cg-seg {
+    display: inline-flex; gap: 2px; padding: 2px;
+    border: var(--cg-stroke-width) solid var(--cg-border);
+    border-radius: var(--cg-radius);
+    background: color-mix(in srgb, var(--cg-fg) 4%, transparent);
+  }
+  .cg-seg-btn {
+    border: none; background: none; cursor: pointer;
+    padding: 3px 12px; border-radius: calc(var(--cg-radius) - 2px);
+    font: inherit; font-size: 12.5px; color: var(--cg-muted);
+  }
+  .cg-seg-btn b { font-variant-numeric: tabular-nums; }
+  .cg-seg-btn.is-on {
+    /* 和 .cg-btn / .cg-panel 同一套画法：先铺不透明的 --cg-bg，
+       再把 --cg-surface 当渐变盖上去。future-retro 主题下 surface 采样到
+       transparent，单写 background: var(--cg-surface) 会让选中态整块透明。 */
+    background-color: var(--cg-bg); background-image: var(--cg-panel-image);
+    color: var(--cg-fg); font-weight: 600;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .12);
+  }
+  .cg-seg-btn:focus-visible { outline: 2px solid var(--cg-accent); outline-offset: 2px; }
   .cg-prefs-empty { margin-top: 8px; color: var(--cg-muted); font-size: 12.5px; }
   .cg-prefs-list { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
   .cg-pref {
@@ -590,31 +638,50 @@
     </div>
   </div>
 
-  <div class="cg-panel cg-people" id="cg-people">
+  <div class="cg-panel cg-people folded" id="cg-people">
     <div class="cg-panel-head">
-      <span class="cg-panel-title">认识的人</span>
+      <button class="cg-fold-hit" id="cg-people-fold" type="button" aria-expanded="false" aria-controls="cg-people-body">
+        <span class="cg-fold-caret"></span>
+        <span class="cg-panel-title">认识的人</span>
+      </button>
       <span class="cg-panel-cap" id="cg-people-cap"></span>
       <span class="cg-panel-act">
         <button class="cg-btn sm" id="cg-person-create" type="button">新增</button>
       </span>
     </div>
-    <div class="cg-people-empty" id="cg-people-empty">正在读取人物…</div>
-    <div class="cg-people-list" id="cg-people-list" hidden></div>
+    <div class="cg-panel-body" id="cg-people-body">
+      <div class="cg-people-empty" id="cg-people-empty">正在读取人物…</div>
+      <div class="cg-people-list" id="cg-people-list" hidden></div>
+      <div class="cg-pager" id="cg-people-pager" hidden>
+        <button class="cg-btn sm" id="cg-people-prev" type="button">上一页</button>
+        <button class="cg-btn sm" id="cg-people-next" type="button">下一页</button>
+        <span id="cg-people-pager-info"></span>
+      </div>
+    </div>
   </div>
 
-  <div class="cg-panel cg-prefs" id="cg-prefs">
+  <div class="cg-panel cg-prefs folded" id="cg-prefs">
     <div class="cg-panel-head">
-      <span class="cg-panel-title">喜好</span>
+      <button class="cg-fold-hit" id="cg-prefs-fold" type="button" aria-expanded="false" aria-controls="cg-prefs-body">
+        <span class="cg-fold-caret"></span>
+        <span class="cg-panel-title">喜好</span>
+      </button>
       <span class="cg-panel-cap" id="cg-prefs-cap"></span>
       <span class="cg-panel-act">
         <button class="cg-btn sm" id="cg-pref-create" type="button">新增</button>
       </span>
     </div>
-    <div class="cg-prefs-empty" id="cg-prefs-empty">正在读取喜好…</div>
-    <div class="cg-prefs-list" id="cg-prefs-list" hidden></div>
-    <p class="cg-prefs-tip" id="cg-prefs-tip">
-      这些是她自己的口味：首次启动时从宿主人设里提炼，之后随着聊天慢慢变浓或变淡。手动加的口味不会被自动观察改掉。
-    </p>
+    <div class="cg-panel-body" id="cg-prefs-body">
+      <div class="cg-seg" id="cg-prefs-seg" role="tablist">
+        <button class="cg-seg-btn is-on" id="cg-prefs-tab-like" type="button" role="tab" aria-selected="true">喜欢 <b id="cg-prefs-n-like">0</b></button>
+        <button class="cg-seg-btn" id="cg-prefs-tab-dislike" type="button" role="tab" aria-selected="false">讨厌 <b id="cg-prefs-n-dislike">0</b></button>
+      </div>
+      <div class="cg-prefs-empty" id="cg-prefs-empty">正在读取喜好…</div>
+      <div class="cg-prefs-list" id="cg-prefs-list" hidden></div>
+      <p class="cg-prefs-tip" id="cg-prefs-tip">
+        这些是她自己的口味：首次启动时从宿主人设里提炼，之后随着聊天慢慢变浓或变淡。手动加的口味不会被自动观察改掉。
+      </p>
+    </div>
   </div>
 
   <div class="cg-panel cg-memories" id="cg-memories">
@@ -645,10 +712,10 @@
       <div class="cg-field">
         <span>每页</span>
         <select id="cg-f-limit">
+          <option value="10" selected>10</option>
           <option value="25">25</option>
-          <option value="50" selected>50</option>
+          <option value="50">50</option>
           <option value="100">100</option>
-          <option value="200">200</option>
         </select>
       </div>
       <span class="cg-spacer"></span>
@@ -1011,12 +1078,16 @@
   // 注意这不改变任何数据，只是给下拉框选个初始值；想翻历史仍然可以切回去。
   var DEFAULT_STATUS_FILTER = 'active';
 
+  // 每页 10 条：50 条一屏时记忆卡片挤成一长条，翻到下面已经不知道自己在看什么了。
+  // 10 条正好一屏能扫完，配合分页器翻起来也不费劲。
+  var DEFAULT_PAGE_SIZE = 10;
+
   var state = {
     sessions: [],
     items: [],
     total: 0,
     offset: 0,
-    limit: 50,
+    limit: DEFAULT_PAGE_SIZE,
     filters: { session_id: '', status: DEFAULT_STATUS_FILTER, category: '', search: '' },
     editing: null,
     labels: { category: {}, status: {} }
@@ -1545,6 +1616,61 @@
     return card;
   }
 
+  // 认识的人：每页 5 个。
+  //
+  // 为什么不是 10：一张人物卡片比一条记忆高得多（名字行 + 好感条 + 六维小条 +
+  // 心里话 + 标签），10 张叠起来一屏放不下，翻页反而失去意义。5 张正好一屏。
+  //
+  // 这里做的是**客户端分页**：查一次拿全量（mem_people 的 limit 上限 500），
+  // 页面自己切片。理由是人物的总数本来就是十几到几十，一次拿全没有负担；
+  // 反过来给后端加 offset 参数，会让「查完整名单再切片」这件事变成两次往返，
+  // 而缺了全量就算不出「共 N 人」这句摘要。
+  var PEOPLE_PAGE_SIZE = 5;
+  var peopleState = { all: [], offset: 0, limit: PEOPLE_PAGE_SIZE };
+
+  function renderPeoplePage() {
+    var box = $('cg-people-list');
+    var empty = $('cg-people-empty');
+    var cap = $('cg-people-cap');
+    var pager = $('cg-people-pager');
+    var all = peopleState.all;
+
+    if (!all.length) {
+      empty.textContent = '还没有记住任何人。点右上角「新增」手动加，或者等抽取跑过几轮自动认人。';
+      empty.hidden = false;
+      box.hidden = true;
+      if (pager) pager.hidden = true;
+      cap.textContent = '';
+      return;
+    }
+
+    // 删掉最后一个之后 offset 可能越界，钳回最后一页 —— 否则会渲染出空白页。
+    var pages = Math.max(1, Math.ceil(all.length / peopleState.limit));
+    var page = Math.floor(peopleState.offset / peopleState.limit);
+    if (page >= pages) {
+      page = pages - 1;
+      peopleState.offset = page * peopleState.limit;
+    }
+    var slice = all.slice(peopleState.offset, peopleState.offset + peopleState.limit);
+
+    box.textContent = '';
+    slice.forEach(function (person) { box.appendChild(renderPerson(person)); });
+    empty.hidden = true;
+    box.hidden = false;
+
+    var manual = all.filter(function (p) { return p.is_manual; }).length;
+    cap.textContent = '共 ' + all.length + ' 人' + (manual ? '，其中 ' + manual + ' 个是手动设定' : '');
+
+    if (pager) {
+      var start = peopleState.offset + 1;
+      var end = peopleState.offset + slice.length;
+      pager.hidden = all.length <= peopleState.limit;
+      $('cg-people-pager-info').textContent = '第 ' + start + '–' + end + ' 人 / 共 ' + all.length + ' 人';
+      $('cg-people-prev').disabled = peopleState.offset <= 0;
+      $('cg-people-next').disabled = end >= all.length;
+    }
+  }
+
   function loadPeople() {
     var box = $('cg-people-list');
     var empty = $('cg-people-empty');
@@ -1563,19 +1689,8 @@
       if (res.roles && res.roles.length) ROLE_TABLE = res.roles;
       if (res.levels && res.levels.length) LEVEL_TABLE = res.levels;
       if (res.axes && res.axes.length) AXIS_TABLE = res.axes;
-      if (!people.length) {
-        empty.textContent = '还没有记住任何人。点右上角「新增」手动加，或者等抽取跑过几轮自动认人。';
-        empty.hidden = false;
-        box.hidden = true;
-        cap.textContent = '';
-        return;
-      }
-      box.textContent = '';
-      people.forEach(function (person) { box.appendChild(renderPerson(person)); });
-      empty.hidden = true;
-      box.hidden = false;
-      var manual = people.filter(function (p) { return p.is_manual; }).length;
-      cap.textContent = '共 ' + people.length + ' 人' + (manual ? '，其中 ' + manual + ' 个是手动设定' : '');
+      peopleState.all = people;
+      renderPeoplePage();
     }).catch(function (err) {
       empty.textContent = '读取人物失败：' + err;
       empty.hidden = false;
@@ -2181,6 +2296,51 @@
 
   var editingPref = null;
 
+  // 当前在看哪一类。默认「喜欢」：实测 16 liking vs 4 dislike，
+  // 打开就落在信息量大的那边，避免一进页面看到空列表以为没数据。
+  var prefTab = 'like';
+  var prefsAll = [];
+
+  function setPrefTab(kind) {
+    prefTab = kind === 'dislike' ? 'dislike' : 'like';
+    var likeBtn = $('cg-prefs-tab-like');
+    var dislikeBtn = $('cg-prefs-tab-dislike');
+    if (likeBtn && dislikeBtn) {
+      likeBtn.classList.toggle('is-on', prefTab === 'like');
+      dislikeBtn.classList.toggle('is-on', prefTab === 'dislike');
+      likeBtn.setAttribute('aria-selected', prefTab === 'like' ? 'true' : 'false');
+      dislikeBtn.setAttribute('aria-selected', prefTab === 'dislike' ? 'true' : 'false');
+    }
+    renderPrefs();
+  }
+
+  function renderPrefs() {
+    var box = $('cg-prefs-list');
+    var empty = $('cg-prefs-empty');
+    if (!box) return;
+    var shown = prefsAll.filter(function (p) {
+      return (prefTab === 'dislike' ? p.kind === 'dislike' : p.kind !== 'dislike');
+    });
+    if (!prefsAll.length) {
+      empty.textContent = '还没有口味。等首次启动从人设提炼，或者点右上角「新增」自己写一条。';
+      empty.hidden = false;
+      box.hidden = true;
+      return;
+    }
+    if (!shown.length) {
+      empty.textContent = prefTab === 'dislike'
+        ? '还没有讨厌的东西。聊天里出现明显反感的话题时会自动记下来，也可以点右上角「新增」。'
+        : '还没有喜欢的东西。';
+      empty.hidden = false;
+      box.hidden = true;
+      return;
+    }
+    box.textContent = '';
+    shown.forEach(function (pref) { box.appendChild(renderPref(pref)); });
+    empty.hidden = true;
+    box.hidden = false;
+  }
+
   function renderPref(pref) {
     var row = el('div', 'cg-pref ' + pref.kind);
 
@@ -2226,21 +2386,15 @@
         box.hidden = true;
         return;
       }
-      var prefs = res.prefs || [];
-      if (!prefs.length) {
-        empty.textContent = '还没有口味。等首次启动从人设提炼，或者点右上角「新增」自己写一条。';
-        empty.hidden = false;
-        box.hidden = true;
-        cap.textContent = '';
-        return;
-      }
-      box.textContent = '';
-      prefs.forEach(function (pref) { box.appendChild(renderPref(pref)); });
-      empty.hidden = true;
-      box.hidden = false;
-      var likes = prefs.filter(function (p) { return p.kind === 'like'; }).length;
-      var dislikes = prefs.length - likes;
-      cap.textContent = '喜欢 ' + likes + ' / 讨厌 ' + dislikes;
+      prefsAll = res.prefs || [];
+      var likes = prefsAll.filter(function (p) { return p.kind === 'like'; }).length;
+      var dislikes = prefsAll.filter(function (p) { return p.kind === 'dislike'; }).length;
+      // 两个分段按钮上各带一个数字，标题行摘要也照旧写全 ——
+      // 折起面板时只剩摘要那一句，它必须自己说清楚两边的量。
+      if ($('cg-prefs-n-like')) $('cg-prefs-n-like').textContent = String(likes);
+      if ($('cg-prefs-n-dislike')) $('cg-prefs-n-dislike').textContent = String(dislikes);
+      if (cap) cap.textContent = '喜欢 ' + likes + ' / 讨厌 ' + dislikes;
+      renderPrefs();
     }).catch(function (err) {
       empty.textContent = '读取喜好失败：' + err;
       empty.hidden = false;
@@ -2299,7 +2453,9 @@
   }
 
   function openPrefCreate() {
-    $('cg-pref-new-kind').value = 'like';
+    // 从「讨厌」页点新增，默认就是讨厌 —— 刚在看的类别就是要加的类别，
+    // 否则每次加厌恶都得先改一次下拉框。
+    $('cg-pref-new-kind').value = prefTab;
     $('cg-pref-new-topic').value = '';
     $('cg-pref-new-strength').value = 0.6;
     $('cg-pref-new-strength-val').textContent = '0.60';
@@ -2356,10 +2512,39 @@
     loadSessions();
   }
 
+  // 折叠一块面板。aria-expanded 要跟着改：屏幕阅读器靠它判断内容是否可见，
+  // 视觉上折叠了但 aria 还写着「已展开」，读屏用户会以为内容没加载出来。
+  function toggleFold(panelId, buttonId, bodyId) {
+    var panel = $(panelId);
+    var button = $(buttonId);
+    if (!panel || !button) return;
+    var folded = panel.classList.toggle('folded');
+    button.setAttribute('aria-expanded', folded ? 'false' : 'true');
+  }
+
   function bind() {
     $('cg-refresh').addEventListener('click', function () { reload(); toast('已刷新'); });
     $('cg-create').addEventListener('click', openCreate);
     $('cg-purge').addEventListener('click', purgeSession);
+
+    $('cg-people-fold').addEventListener('click', function () {
+      toggleFold('cg-people', 'cg-people-fold', 'cg-people-body');
+    });
+    $('cg-prefs-fold').addEventListener('click', function () {
+      toggleFold('cg-prefs', 'cg-prefs-fold', 'cg-prefs-body');
+    });
+    $('cg-people-prev').addEventListener('click', function () {
+      if (peopleState.offset <= 0) return;
+      peopleState.offset = Math.max(0, peopleState.offset - peopleState.limit);
+      renderPeoplePage();
+    });
+    $('cg-people-next').addEventListener('click', function () {
+      if (peopleState.offset + peopleState.limit >= peopleState.all.length) return;
+      peopleState.offset += peopleState.limit;
+      renderPeoplePage();
+    });
+    $('cg-prefs-tab-like').addEventListener('click', function () { setPrefTab('like'); });
+    $('cg-prefs-tab-dislike').addEventListener('click', function () { setPrefTab('dislike'); });
 
     $('cg-f-session').addEventListener('change', function (event) {
       state.filters.session_id = event.target.value;
@@ -2378,7 +2563,7 @@
       loadItems();
     });
     $('cg-f-limit').addEventListener('change', function (event) {
-      state.limit = parseInt(event.target.value, 10) || 50;
+      state.limit = parseInt(event.target.value, 10) || DEFAULT_PAGE_SIZE;
       state.offset = 0;
       loadItems();
     });

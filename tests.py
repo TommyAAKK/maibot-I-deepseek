@@ -1744,6 +1744,11 @@ async def test_plugin(tmp: str) -> None:
             update={"boundary": plugin._config.boundary.model_copy(update=patch)}
         )
 
+    def _set_initiative(**patch: Any) -> None:
+        plugin._config = plugin._config.model_copy(  # type: ignore[assignment]
+            update={"initiative": plugin._config.initiative.model_copy(update=patch)}
+        )
+
     _set_inject(max_items_per_category=1)
 
     seen_rounds: list[str] = []
@@ -2006,6 +2011,117 @@ async def test_plugin(tmp: str) -> None:
     # 没有 items 时不能崩，也不能瞎造
     no_items = await plugin.inject_planner_state(session_id=bd_sid)
     check(no_items.get("action") == "continue", "planner hook 在没有 items 时安全返回")
+
+    # ── 端到端：自主发言闸门 ──
+    # 这是用户 m07262 明确要的：精力/心情不该去压「发言频率」，而该决定
+    # 「这一轮到底开不开口」。宿主不给 abort 权限，所以手段是从工具清单里
+    # 把 reply 收走 —— 模型不是被劝别说，是没有说的手段。
+    _gate_items = [
+        {"item_type": "system", "meta": {"item_id": "g1", "logical_turn_id": None,
+                                         "timestamp": "2026-01-01T00:00:00+08:00"},
+         "parts": [{"type": "text", "text": "原有系统提示"}]},
+        {"item_type": "user", "meta": {"item_id": "g2", "logical_turn_id": None,
+                                       "timestamp": "2026-01-01T00:00:01+08:00"},
+         "parts": [{"type": "text", "text": "今天天气怎么样"}]},
+    ]
+    _gate_tools = [
+        {"type": "function", "function": {"name": "reply", "description": "回复",
+                                          "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "send_emoji", "description": "发表情",
+                                          "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "query_memory", "description": "查记忆",
+                                          "parameters": {"type": "object", "properties": {}}}},
+    ]
+
+    # 默认关：工具清单原样保留，一个字都不动
+    _gate_off = await plugin.inject_planner_state(
+        session_id=bd_sid, items=json.loads(json.dumps(_gate_items)),
+        item_schema_version=1, tool_definitions=json.loads(json.dumps(_gate_tools)),
+    )
+    _gate_off_tools = (_gate_off.get("modified_kwargs") or {}).get("tool_definitions")
+    check(
+        [d["function"]["name"] for d in _gate_off_tools]
+        == ["reply", "send_emoji", "query_memory"],
+        "自主发言闸门默认关：工具清单一个字都不动",
+    )
+
+    # 打开闸门 + 低好感 + 心情差 + 没兴趣 → 收回 reply 和 send_emoji
+    _set_initiative(enabled=True, threshold=0.45)
+    store.upsert_person({
+        "person_key": "qq:20002", "platform": "qq", "user_id": "20002",
+        "display_name": "老王", "relation_role": "friend", "role_confidence": 1.0,
+        "role_source": "manual", "affection": 8.0, "tags": [],
+        "axes": {"trust": 0.3, "closeness": 0.2, "respect": 0.4,
+                 "tension": 0.3, "familiarity": 0.3, "perceived_warmth": 0.3},
+    })
+    plugin._mood.set_manual(  # type: ignore[union-attr]
+        primitives={"anger": 0.5, "joy": 0.05, "calm": 0.05, "anxiety": 0.5},
+        energy=0.3,
+        label="有点低落",
+    )
+    _gate_low = await plugin.inject_planner_state(
+        session_id=bd_sid, items=json.loads(json.dumps(_gate_items)),
+        item_schema_version=1, tool_definitions=json.loads(json.dumps(_gate_tools)),
+    )
+    _gate_low_tools = [
+        d["function"]["name"]
+        for d in ((_gate_low.get("modified_kwargs") or {}).get("tool_definitions") or [])
+    ]
+    check("reply" not in _gate_low_tools, "低分时收回 reply（没有说的手段）")
+    check("send_emoji" not in _gate_low_tools, "连 send_emoji 一起收回（发表情包也是发言）")
+    check("query_memory" in _gate_low_tools, "查询类工具不受影响（她还可以默默查资料）")
+
+    # 被 @ → 无论分数多低都要能回
+    plugin._tracker.mark_dirty({  # type: ignore[union-attr]
+        "session_id": bd_sid, "platform": "qq", "message_info": {
+            "group_info": {"group_id": "", "group_name": ""},
+            "user_info": {"user_id": "20002", "user_nickname": "老王"},
+        }, "is_at": True, "is_mentioned": False,
+    })
+    _gate_at = await plugin.inject_planner_state(
+        session_id=bd_sid, items=json.loads(json.dumps(_gate_items)),
+        item_schema_version=1, tool_definitions=json.loads(json.dumps(_gate_tools)),
+    )
+    _gate_at_tools = [
+        d["function"]["name"]
+        for d in ((_gate_at.get("modified_kwargs") or {}).get("tool_definitions") or [])
+    ]
+    check("reply" in _gate_at_tools, "被 @ 时即使分数很低也能开口（@ 必回）")
+
+    # 关掉「@ 必回」后，@ 也要过软评分
+    _set_initiative(at_always_reply=False)
+    _gate_at_off = await plugin.inject_planner_state(
+        session_id=bd_sid, items=json.loads(json.dumps(_gate_items)),
+        item_schema_version=1, tool_definitions=json.loads(json.dumps(_gate_tools)),
+    )
+    _gate_at_off_tools = [
+        d["function"]["name"]
+        for d in ((_gate_at_off.get("modified_kwargs") or {}).get("tool_definitions") or [])
+    ]
+    check("reply" not in _gate_at_off_tools, "关掉 @ 必回后，@ 也要过软评分")
+    _set_initiative(at_always_reply=True, enabled=False)
+
+    # 关键回归：闸门不能被边界感的提前返回连坐跳过。
+    # 历史 bug：整个方法包在一个大 try 里，note_to_planner=False（默认值）
+    # 时就 return 了，闸门代码在 return 之后 —— 永远不跑。
+    # 用一个没有 @ 记录的会话，免得上面那条 @ 时间窗干扰判定。
+    _gate_sid2 = "qq:private:gateonly"
+    _set_boundary(note_to_planner=False)
+    _set_initiative(enabled=True)
+    _gate_with_boundary_off = await plugin.inject_planner_state(
+        session_id=_gate_sid2, items=json.loads(json.dumps(_gate_items)),
+        item_schema_version=1, tool_definitions=json.loads(json.dumps(_gate_tools)),
+    )
+    _gate_wbo_tools = [
+        d["function"]["name"]
+        for d in ((_gate_with_boundary_off.get("modified_kwargs") or {}).get("tool_definitions") or [])
+    ]
+    check(
+        "reply" not in _gate_wbo_tools,
+        "note_to_planner 关着时闸门仍要生效（不跟边界感共用一个提前返回）",
+    )
+    _set_initiative(enabled=False)
+    plugin._mood.reset()  # type: ignore[union-attr]
 
     store.delete_session_items(abs_sid)
     store.delete_session_items(abs_group)
@@ -2788,6 +2904,10 @@ def test_config() -> None:
         "prefs",
         "absence",
         "boundary",
+        "presence",
+        "backfill",
+        "initiative",
+        "history",
         "debug",
     )
 
@@ -2814,7 +2934,7 @@ def test_config() -> None:
                 missing_label.append(f"[{section}].{name}")
             if not hint or not has_cjk(hint):
                 missing_hint.append(f"[{section}].{name}")
-    check(total == 145, f"{len(sections)} 个节共 145 个配置项（实际 {total}）")
+    check(total == 168, f"{len(sections)} 个节共 168 个配置项（实际 {total}）")
     check(not missing_label, f"每个配置项都有中文 label（缺 {missing_label}）")
     check(not missing_hint, f"每个配置项都有中文 hint（缺 {missing_hint}）")
 
@@ -4574,6 +4694,638 @@ def test_boundary() -> None:
     check("心情一般" in calm, "没有明显情绪时说「心情一般」")
 
 
+def test_presence() -> None:
+    """在场感知：把「多久没说话」拆成「她不在」和「对方没来」。
+
+    这个模块存在的唯一理由是一条真机事故：用户每天 00:00 关机、11:00 开机，
+    某天上午开机后她看到「73 小时没说话」就说「你怎么这么久没来」——
+    可其中 33.8 小时是她自己不在。所以核心断言全是围绕「别把关机算成冷落」。
+    """
+
+    print("[14] 在场感知")
+    presence_mod = importlib.import_module(f"{_PKG_NAME}.cg_presence")
+    from datetime import datetime, timedelta
+
+    # base 必须**带时区**：模块内部统一用 aware datetime（宿主写的是本地时间的
+    # datetime.now()，无时区字符串按本地时区补 tzinfo）。naive 和 aware 直接比
+    # 恒为 False，会造出一堆看起来像「算错了」的假失败。
+    base = datetime(2026, 11, 5, 12, 0, 0).astimezone()
+
+    # ── 时间解析：宿主给的是无时区 ISO 字符串 ──
+    # 解析结果一律带时区（宿主写的是本地时间的 datetime.now()），所以比对时
+    # 要把 tzinfo 剥掉再比，否则 aware 和 naive 直接 == 恒为 False。
+    parsed = presence_mod._to_datetime("2026-11-05T11:00:00")
+    check(parsed is not None, "能解析宿主 _to_dict 产出的无时区 ISO 字符串")
+    check(
+        parsed.replace(tzinfo=None) == datetime(2026, 11, 5, 11, 0, 0),
+        f"解析出来的时刻正确（实际 {parsed}）",
+    )
+    check(parsed.tzinfo is not None, "解析结果带时区（后续区间计算不能用 naive datetime）")
+    check(presence_mod._to_datetime("") is None, "空字符串解析成 None")
+    check(presence_mod._to_datetime("乱码") is None, "非法字符串解析成 None")
+    check(
+        presence_mod._to_datetime(1_800_000_000.0) is not None,
+        "能解析 float 形式的时间戳",
+    )
+    check(
+        presence_mod._to_datetime("1800000000") is not None,
+        "能解析字符串形式的 unix 时间戳",
+    )
+
+    # ── 区间合并：相邻窗口要合并，否则离线时长会算爆 ──
+    # 宿主每 5 分钟写一行、每次把 end 往后推 1 分钟，所以正常必然重叠。
+    rows = [
+        {"start_timestamp": base - timedelta(hours=6), "end_timestamp": base - timedelta(hours=5)},
+        {"start_timestamp": base - timedelta(hours=5, minutes=-1), "end_timestamp": base - timedelta(hours=4)},
+        {"start_timestamp": base - timedelta(hours=3), "end_timestamp": base - timedelta(hours=2)},
+    ]
+    merged = presence_mod.merge_online_windows(rows)
+    check(len(merged) == 2, f"重叠窗口合并（3 段 → {len(merged)} 段）")
+    check(
+        merged[0][0] == base - timedelta(hours=6),
+        "合并后的区间从最早那个起点开始",
+    )
+    check(
+        merged[0][1] == base - timedelta(hours=4),
+        "合并后的区间到最晚那个终点结束（中间那一分钟没被当成离线）",
+    )
+    # 间隔超过 slack 就不合并
+    far = [
+        {"start_timestamp": base - timedelta(hours=6), "end_timestamp": base - timedelta(hours=5)},
+        {"start_timestamp": base - timedelta(hours=4), "end_timestamp": base - timedelta(hours=3)},
+    ]
+    check(
+        len(presence_mod.merge_online_windows(far)) == 2,
+        "间隔超过容差的两段不合并（那是真的离线）",
+    )
+    # end < start 的残行不能把时长算成负数
+    broken = presence_mod.merge_online_windows(
+        [{"start_timestamp": base, "end_timestamp": base - timedelta(hours=1)}]
+    )
+    check(
+        len(broken) == 1 and broken[0][1] >= broken[0][0],
+        "end < start 的脏行被拉平成零长度而不是负数",
+    )
+
+    # ── 覆盖计算 ──
+    windows = [(base - timedelta(hours=10), base - timedelta(hours=8))]
+    check(
+        presence_mod.overlap_seconds(
+            windows, base - timedelta(hours=12), base
+        )
+        == 2 * 3600.0,
+        "覆盖时长只算真正落在窗口内的那两小时",
+    )
+    check(
+        presence_mod.overlap_seconds(windows, base - timedelta(hours=6), base) == 0.0,
+        "完全不相交时覆盖为 0",
+    )
+
+    # ── 四档判定 ──
+    # 太短的间隔什么都不必提 —— 她离开两小时回来说「我刚才不在」是废话。
+    # 这条是实跑真机副本时发现的：2.2 小时的间隔被老版本判成 away 并去注入。
+    check(
+        presence_mod.classify(gap_hours=2.2, awake_hours=0.1, offline_hours=2.1)
+        == "none",
+        "间隔不到门槛时什么都别提（「我刚离开两小时」不是缺席感）",
+    )
+    # away：她大半时间不在，且间隔确实够长
+    check(
+        presence_mod.classify(
+            gap_hours=12.0, awake_hours=0.5, offline_hours=11.5
+        )
+        == "away",
+        "间隔 12 小时但离线 11.5 小时 → 「我不在」而不是「被冷落」",
+    )
+    # none：刚聊过
+    check(
+        presence_mod.classify(gap_hours=0.2, awake_hours=0.2, offline_hours=0.0)
+        == "none",
+        "间隔很短 → 刚聊过",
+    )
+    # cold：真的很久没来
+    check(
+        presence_mod.classify(gap_hours=40.0, awake_hours=39.0, offline_hours=1.0)
+        == "cold",
+        "醒着等了 39 小时 → 这才该有缺席感",
+    )
+    # pending 优先级最高
+    check(
+        presence_mod.classify(
+            gap_hours=40.0, awake_hours=39.0, offline_hours=1.0, pending=3
+        )
+        == "pending",
+        "有待补消息时优先补洞（拿没读过的消息当感情依据很假）",
+    )
+
+    # ── analyse 把三件事串起来 ──
+    presence = presence_mod.analyse(
+        last_seen_ts=(base - timedelta(hours=12)).timestamp(),
+        windows=windows,  # 只覆盖 10~8 小时前
+        now=base,
+    )
+    check(abs(presence.gap_hours - 12.0) < 1e-3, "间隔算对了")
+    check(abs(presence.offline_hours - 10.0) < 1e-3, "离线时长 = 间隔 − 在线覆盖")
+    check(abs(presence.awake_hours - 2.0) < 1e-3, "醒着时长 = 间隔 − 离线时长")
+    check(
+        presence.gap_hours - presence.offline_hours - presence.awake_hours < 1e-6,
+        "三段之和必须回到总间隔，不能凭空多出或少掉时间",
+    )
+    # 未来时间戳 / 没有时间戳
+    check(
+        presence_mod.analyse(last_seen_ts=base.timestamp() + 3600, windows=windows, now=base)
+        .gap_seconds
+        == 0.0,
+        "未来时间戳（时钟回拨）按 0 处理",
+    )
+    check(
+        presence_mod.analyse(last_seen_ts=0, windows=windows, now=base).gap_seconds == 0.0,
+        "没有 last_seen 时返回全零",
+    )
+
+    # ── 措辞：只说事实，不带情绪，不怪对方 ──
+    away_note = presence_mod.render_away_note(hours=11.5, how="11 小时")
+    check("不在" in away_note, "「我不在」的提示要说清是她不在")
+    check(
+        "不是对方没来" in away_note,
+        "必须明确排除「对方冷落我」这个误读",
+    )
+    check(
+        "冷落" not in away_note and "怪" not in away_note,
+        "不写任何指责性的词",
+    )
+
+    # 反向断言：这些常量一旦被改小，离线会被判成在线、结论全反。
+    check(
+        presence_mod.MERGE_SLACK.total_seconds() >= 60,
+        "合并容差不能太小（太小会把连续在线切成几十段、离线算爆）",
+    )
+    check(
+        presence_mod.ONLINE_SLACK.total_seconds() >= 60,
+        "「此刻在线」的判定也要有容差",
+    )
+
+
+def test_initiative() -> None:
+    """自主发言闸门：兴趣 / 好感度 / 心情 加权，硬过滤优先。
+
+    这是用户明确要的东西（原话「精力门控即便不开 focus 模式，也不应该是简单地
+    调整发言频率」）。核心语义是「决定不说」而不是「延迟」。
+    """
+
+    print("[15] 自主发言")
+    init_mod = importlib.import_module(f"{_PKG_NAME}.cg_initiative")
+
+    # ── 兴趣打分 ──
+    likes = ["原神", "编程"]
+    check(
+        init_mod.interest_score("今天又去蹭原神的活动了", likes=likes) > 0.0,
+        "命中喜欢的话题要有分",
+    )
+    check(
+        init_mod.interest_score("今天天气不错", likes=likes) == 0.0,
+        "没命中任何喜欢的话题就是 0 分",
+    )
+    check(
+        init_mod.interest_score("原神和编程都比拼图好玩", likes=likes) >= 0.79,
+        "命中两条 → 0.8（比只命中一条高，但还没到顶）",
+    )
+    check(
+        init_mod.interest_score("原神、编程、还有拼图", likes=["原神", "编程", "拼图"]) >= 0.99,
+        "命中三条封顶 1.0（再多也一样）",
+    )
+    check(
+        init_mod.interest_score("", likes=likes) == 0.0,
+        "空文本不产生兴趣分",
+    )
+    check(
+        init_mod.interest_score("原神" * 200, likes=likes)
+        == init_mod.interest_score("原神", likes=likes),
+        "**长度不加权**：长和有兴趣是两件事",
+    )
+
+    # ── 好感度 / 心情 ──
+    check(init_mod.affection_score(0.0) == 0.0, "好感度为 0 时分数为 0")
+    check(
+        init_mod.affection_score(init_mod.AFFECTION_CEILING) >= 0.99,
+        "好感度到顶时分数到顶",
+    )
+    check(
+        init_mod.affection_score(999.0) <= 1.0,
+        "好感度再高也不超过 1.0",
+    )
+    check(init_mod.mood_score(valence=1.0, arousal=1.0) >= 0.99, "心情很好时分高")
+    check(init_mod.mood_score(valence=-1.0, arousal=0.0) <= 0.01, "心情很差时分低")
+
+    # ── 硬过滤优先 ──
+    decision = init_mod.evaluate(
+        at_pending=True, at_always_reply=True,
+        exhausted=True, boundary_silent=True,
+        text="完全无关的话题", likes=[], affection=0.0, valence=-1.0,
+    )
+    check(decision.allow, "被 @ 时优先于「能耗尽」「边界感」等所有硬过滤")
+    check(decision.reason == init_mod.REASON_AT, f"原因是「被@」（实际 {decision.reason}）")
+
+    decision = init_mod.evaluate(
+        at_pending=True, at_always_reply=False,
+        exhausted=True,
+        text="", likes=[], affection=0.0, valence=0.0,
+    )
+    check(not decision.allow, "@ 必回开关关掉后，能耗尽仍然能拦住")
+
+    decision = init_mod.evaluate(at_pending=False, mentioned_pending=True,
+                                 mentioned_always_reply=True)
+    check(decision.allow and decision.reason == init_mod.REASON_MENTIONED,
+          "被提到 + 开关打开 → 必回")
+
+    decision = init_mod.evaluate(at_pending=False, mentioned_pending=True,
+                                 mentioned_always_reply=False,
+                                 text="", likes=[], affection=0.0, valence=0.0,
+                                 energy=0.0, threshold=0.99)
+    check(not decision.allow,
+          "被提到但开关关掉时走软评分（不会硬性必回）——@ 和「提到」是两个开关")
+
+    decision = init_mod.evaluate(exhausted=True)
+    check(
+        not decision.allow and decision.hard and decision.reason == init_mod.REASON_EXHAUSTED,
+        "精力耗尽 → 硬拦，且标记 hard（不参与软评分）",
+    )
+
+    decision = init_mod.evaluate(boundary_silent=True)
+    check(
+        not decision.allow and decision.reason == init_mod.REASON_BOUNDARY,
+        "边界感判「不想接话」时主动必须一起压掉（两处共用一个闸门）",
+    )
+
+    # ── 软评分 ──
+    good = init_mod.evaluate(
+        text="今天原神新版本", likes=["原神"],
+        affection=80.0, valence=0.8, arousal=0.7, energy=1.0,
+    )
+    check(good.allow, f"三样都好时应该开口（score={good.score:.2f}）")
+    check(good.reason == init_mod.REASON_ALLOW, "放行的原因是「可以开口」")
+
+    bad = init_mod.evaluate(
+        text="今天天气不错", likes=["原神"],
+        affection=0.0, valence=-0.5, arousal=0.2, energy=0.3,
+    )
+    check(not bad.allow, f"三样都差时不该开口（score={bad.score:.2f}）")
+    check(bad.reason == init_mod.REASON_LOW_SCORE, "拦截的原因是「分数不够」")
+    check(
+        set(bad.parts) == {"interest", "affection", "mood", "energy"},
+        "分数明细要能逐项看到（日志里靠它排查「为什么不说话」）",
+    )
+
+    # 没有文本时 interest 不参与，权重重新归一化 —— 否则「没话题」会被系统性压低分
+    no_text = init_mod.evaluate(
+        text="", likes=["原神"], affection=80.0, valence=0.8, arousal=0.7, energy=1.0
+    )
+    check(
+        "interest" not in no_text.parts,
+        "没有可读文本时兴趣项不参与打分",
+    )
+    check(
+        no_text.allow,
+        "没有文本时其余三项足够好就应该开口（权重要重新归一化）",
+    )
+
+    check(init_mod.evaluate(enabled=False).allow, "闸门总开关关闭时恒放行")
+    check(
+        init_mod.evaluate(enabled=False).reason == init_mod.REASON_DISABLED,
+        "关闭状态要能被日志看出来",
+    )
+
+    # ── 工具过滤 ──
+    tools = [
+        {"type": "function", "function": {"name": "reply", "parameters": {}}},
+        {"type": "function", "function": {"name": "send_emoji", "parameters": {}}},
+        {"type": "function", "function": {"name": "query_memory", "parameters": {}}},
+    ]
+    kept, removed = init_mod.filter_tools(tools, allow_reply=False, drop=("reply", "send_emoji"))
+    check(len(kept) == 1, "不许开口时把 reply 和 send_emoji 都收回")
+    check(kept[0]["function"]["name"] == "query_memory", "只留下不发消息的工具")
+    check(set(removed) == {"reply", "send_emoji"}, "被收回的工具名要报出来（日志用）")
+
+    kept, removed = init_mod.filter_tools(tools, allow_reply=True, drop=("reply", "send_emoji"))
+    check(len(kept) == 3 and removed == [], "允许开口时清单原样不动")
+
+    kept, removed = init_mod.filter_tools(
+        [{"name": "reply"}, {"name": "query_memory"}], allow_reply=False, drop=("reply",)
+    )
+    check(len(kept) == 1 and kept[0]["name"] == "query_memory", "兼容裸 name 形态")
+
+    kept, removed = init_mod.filter_tools(None, allow_reply=False)
+    check(kept is None, "工具清单形态不认识时返回 None（**看不懂就别改**）")
+    check(removed == [], "看不懂时也不谎报收回了什么")
+
+    # ── 描述 ──
+    text = init_mod.describe(bad)
+    check("分数不够" in text, "描述里带原因")
+    check("score=" in text and "interest=" in text, "描述里带各项分数")
+
+
+def test_backfill() -> None:
+    """历史补抓：把「她没看见的那几天」从 QQ 端捞回来。
+
+    三个坑都是真机撞出来的（NapCat 文档写错的地方）：锚点是 ``message_id``
+    不是 ``message_seq``；``count`` 上限 200 且会被内部裁剪；**空数组不等于
+    不可用**（用户原话「私聊应该不是拿不到，而是这几天并没有私聊」）。
+    """
+
+    print("[16] 历史补抓")
+    backfill_mod = importlib.import_module(f"{_PKG_NAME}.cg_backfill")
+    now = 1_800_000_000.0
+
+    # ── 剥壳：适配器返回的是原始响应字典 ──
+    rows, error = backfill_mod._unwrap_history(
+        {"status": "ok", "retcode": 0, "data": {"messages": [{"message_id": 1}]}}
+    )
+    check(len(rows) == 1 and error == "", "标准响应能取到 messages")
+    check(
+        backfill_mod._unwrap_history({"status": "failed", "retcode": 100,
+                                      "wording": "failed to resolve UID"})[1] != "",
+        "status 不是 ok 时返回错误（不能当「没有消息」）",
+    )
+    check(
+        backfill_mod._unwrap_history({"status": "ok", "retcode": 0, "data": {"messages": []}})
+        == ([], ""),
+        "**空数组是正常结果**，不是错误",
+    )
+    check(
+        backfill_mod._unwrap_history(None)[1] != "",
+        "None 响应报错",
+    )
+
+    # ── OneBot → 插件消息转换 ──
+    raw = {
+        "message_id": 12345,
+        "time": 1_800_000_000,
+        "user_id": "100000001",
+        "sender": {"user_id": "100000001", "nickname": "群友A", "card": "群友A"},
+        "group_id": "999",
+        "message": [{"type": "text", "data": {"text": "你好"}}],
+        "raw_message": "你好",
+    }
+    converted = backfill_mod.to_plugin_message(
+        raw, platform="qq", session_id="s1", group_id="999", group_name="测试群"
+    )
+    check(converted.get("message_id") == "12345", "message_id 转成字符串")
+    check(
+        converted["message_info"]["user_info"]["user_id"] == "100000001",
+        "用户 id 落进 message_info.user_info",
+    )
+    check(
+        converted["message_info"]["group_info"]["group_id"] == "999",
+        "群 id 落进 group_info",
+    )
+    check(
+        converted["raw_message"][0]["data"] == "你好",
+        "消息段的 data 是字符串（插件内部认的是这套格式，不是 OneBot 的 dict）",
+    )
+    check(converted.get("_backfilled") is True, "打上补抓标记，便于区分来源")
+    check(
+        backfill_mod.to_plugin_message({}, platform="qq", session_id="s1") == {},
+        "没有 message_id 的脏数据直接丢弃",
+    )
+
+    # 非文本段只留摘要，别把 base64 塞进提示词
+    image_msg = backfill_mod.to_plugin_message(
+        {
+            "message_id": 1, "time": 1_800_000_000, "user_id": "1",
+            "sender": {"user_id": "1", "nickname": "A"},
+            "message": [{"type": "image", "data": {"file": "a.jpg", "url": "http://x/a.jpg",
+                                                   "base64": "AAAA" * 1000}}],
+        },
+        platform="qq", session_id="s1",
+    )
+    image_text = image_msg["raw_message"][0]["data"]
+    check("base64" not in image_text, "图片段不保留 base64")
+    check(len(image_text) < 200, "图片段只留短摘要")
+
+    # ── 合并与去重 ──
+    host = [
+        {"message_id": "1", "timestamp": "100", "processed_plain_text": "宿主版"},
+        {"message_id": "2", "timestamp": "200", "processed_plain_text": "只有宿主有"},
+    ]
+    extra = [
+        {"message_id": "1", "timestamp": "100", "processed_plain_text": "补抓版"},
+        {"message_id": "3", "timestamp": "300", "processed_plain_text": "只有补抓有"},
+    ]
+    merged = backfill_mod.merge_messages(host, extra)
+    check(len(merged) == 3, "按 message_id 去重后合并（2 + 2 → 3）")
+    check(
+        [m["message_id"] for m in merged] == ["1", "2", "3"],
+        "合并结果按时间升序",
+    )
+    first = next(m for m in merged if m["message_id"] == "1")
+    check(
+        first["processed_plain_text"] == "宿主版",
+        "重复的消息保留宿主版本（更可信、带 reply_to）",
+    )
+
+    # ── 节流与起点 ──
+    check(
+        backfill_mod.should_backfill(last_backfill_ts=0.0, now=now),
+        "从没补过就应该补",
+    )
+    check(
+        not backfill_mod.should_backfill(last_backfill_ts=now - 60, now=now,
+                                         min_interval=1800.0),
+        "刚补过不到最小间隔就不再补（补的是关机留下的洞，不是天天有新洞）",
+    )
+    check(
+        backfill_mod.should_backfill(last_backfill_ts=now - 3600, now=now,
+                                     min_interval=1800.0),
+        "超过最小间隔允许再补",
+    )
+    check(
+        abs(backfill_mod.default_since(last_extract_ts=now - 3600, now=now) - (now - 3600)) < 1.0,
+        "有上次抽取时间就从那里开始补",
+    )
+    check(
+        abs(
+            backfill_mod.default_since(last_extract_ts=0, now=now, max_age_days=10.0)
+            - (now - 10 * 86400.0)
+        )
+        < 1.0,
+        "从没抽取过就退回「最多补多少天」",
+    )
+
+    # 描述
+    desc = backfill_mod.describe_result(
+        backfill_mod.BackfillResult(messages=[{}] * 5, pages=2, reached_start=True)
+    )
+    check("5" in desc, "描述里带条数")
+    check("尽头" in desc or "到头" in desc, "翻到缓存尽头要说出来")
+
+    # 反向断言：这些数字是实测出来的，改小会漏消息、改大会撑爆提示词
+    check(backfill_mod.PAGE_SIZE <= 200, "每页条数不超过适配器硬上限 200")
+    check(backfill_mod.MAX_AGE_DAYS <= 15, "最多补的天数不超过适配器缓存深度")
+
+
+def test_history() -> None:
+    """未读历史：她知道自己错过了什么，也能在被提起时翻回去看。
+
+    用户第 41 轮的原话：「正常人虽然会翻看历史消息，但仅限于几十条的程度，
+    对于 99+ 这种，一般不会从头看完……更远的就需要在别人明确提起时，bot 才会
+    一边说『我翻翻看哦』，一边回看这些消息。」
+
+    核心取舍只有一条：**L1 只给条数和时间，不给内容。** 给了内容，她就从
+    「那会儿我不在」变成「其实我都看过」——那正是用户嫌弃的那种假装。
+    """
+
+    print("[17] 未读历史")
+    history_mod = importlib.import_module(f"{_PKG_NAME}.cg_history")
+
+    # ── 时间工具：宿主给字符串、适配器给数字 ──
+    check(history_mod.as_float("1800000000.5") == 1_800_000_000.5, "能解析字符串时间戳")
+    check(history_mod.as_float(1_800_000_000) == 1_800_000_000.0, "能解析数字时间戳")
+    check(history_mod.as_float("乱码") == 0.0, "非法字符串退化成 0")
+    check(history_mod.as_float(None) == 0.0, "None 退化成 0")
+    check(history_mod.as_float(True) == 0.0, "bool 不当成数字（True 不是 1 秒）")
+
+    now = time.time()
+    yesterday = now - 86400.0
+    check(history_mod.format_day(now) == "今天", "今天的消息说「今天」")
+    check(history_mod.format_day(yesterday) == "昨天", "一天前说「昨天」")
+    check(history_mod.format_day(now - 2 * 86400.0) == "前天", "两天前说「前天」")
+    check("月" in history_mod.format_day(now - 20 * 86400.0), "更早的给具体日期")
+    check(history_mod.format_day(0) == "?", "拿不到时间就是问号")
+
+    # 不用「3 天前」这种相对量：说的是「昨晚 11 点」，写成「3 天前」就没法对着
+    # 时间线讲了。
+    span = history_mod.describe_span(yesterday, yesterday + 3600.0, now=now)
+    check("昨天" in span, f"同一天的时间段带日期（实际 {span}）")
+    check(history_mod.describe_duration(1800) == "30 分钟", "半小时说成「30 分钟」")
+    check("小时" in history_mod.describe_duration(7200), "两小时说成小时")
+    check("天" in history_mod.describe_duration(3 * 86400), "三天说成天")
+
+    # ── L1 拆分：窗口之外才是洞 ──
+    msgs = []
+    for i in range(10):
+        msgs.append(
+            {
+                "message_id": f"m{i}",
+                "timestamp": str(1_800_000_000.0 + i * 60),
+                "processed_plain_text": f"第{i}条",
+                "message_info": {
+                    "user_info": {"user_id": "u1", "user_nickname": "阿岚"},
+                    "group_info": {"group_id": "g1", "group_name": "测试群"},
+                },
+                "raw_message": [],
+            }
+        )
+    window, hole = history_mod.split_window(msgs, 3)
+    check(len(window) == 3, "窗口只留最后 3 条")
+    check(len(hole) == 7, "剩下 7 条进洞")
+    check(window[0]["message_id"] == "m7", "窗口是**最近**的 3 条")
+    check(hole[-1]["message_id"] == "m6", "洞紧接着窗口之前")
+
+    # since_ts 之外的历史在上一轮已经处理过，不该每轮重复报同一段
+    # rest 是 m0..m6（base+0..base+360），since_ts = base+240，所以只有 m5/m6 是新的洞
+    _, hole2 = history_mod.split_window(msgs, 3, since_ts=1_800_000_000.0 + 4 * 60)
+    check(len(hole2) == 2, "上次抽取之前的消息不算本次的洞")
+    check(history_mod.split_window(msgs, 0)[0] == [], "max_read=0 时窗口为空")
+    check(history_mod.split_window([], 3) == ([], []), "空输入返回两个空列表")
+
+    # ── L1 摘要：只有条数和时间 ──
+    summary = history_mod.summarize_hole(hole)
+    check(summary is not None, "能从洞里算出摘要")
+    check(summary["count"] == 7, "摘要带条数")
+    check(summary["start_ts"] < summary["end_ts"], "摘要带时间范围")
+    check(
+        history_mod.summarize_hole([{"timestamp": "0"}]) is None,
+        "拿不到时间戳就不记洞（说不出「昨晚」就别瞎猜）",
+    )
+
+    # 渲染出来的文本**绝对不能**包含消息正文。这是整个功能的立身之本：
+    # 一旦出现内容，她就从「我不在」变成「我都看过」。
+    note = history_mod.render_unread_note(
+        [{"start_ts": yesterday, "end_ts": yesterday + 3600.0, "count": 199}],
+        now=now,
+    )
+    check("199" in note, "未读提示带条数")
+    check("昨天" in note, "未读提示带时间")
+    check("第0条" not in note and "第6条" not in note, "**未读提示不含任何消息内容**")
+    check("companion-unread" in note, "带起止标记")
+    check("假装" in note, "明确禁止假装看过")
+    check(history_mod.render_unread_note([]) == "", "没有洞时返回空串")
+    check(
+        history_mod.render_unread_note(
+            [{"start_ts": yesterday, "end_ts": yesterday + 60, "count": 0}], now=now
+        )
+        == "",
+        "条数为 0 的洞不渲染",
+    )
+    group_note = history_mod.render_unread_note(
+        [{"start_ts": yesterday, "end_ts": yesterday + 3600.0, "count": 55}],
+        chat_type="group",
+        now=now,
+    )
+    check("这个群" in group_note, "群聊措辞说的是「这个群」")
+    private_note = history_mod.render_unread_note(
+        [{"start_ts": yesterday, "end_ts": yesterday + 3600.0, "count": 5}],
+        chat_type="private",
+        who="阿岚",
+        now=now,
+    )
+    check("阿岚" in private_note, "私聊措辞带对方名字")
+
+    # ── 原文行：入库存的是什么 ──
+    rows = history_mod.to_history_rows(hole)
+    check(len(rows) == 7, "洞里的 7 条都转成入库行")
+    check(all(row["ts"] > 0 for row in rows), "每行都有时间戳")
+    check(all(row["text"] for row in rows), "每行都有正文")
+    check(rows[0]["ts"] < rows[-1]["ts"], "入库行按时间升序")
+    clipped = history_mod.to_history_rows(hole, limit=3)
+    check(len(clipped) == 3, "超出上限时裁剪")
+    check(clipped[-1]["message_id"] == "m6", "裁掉的是**更早**的那些")
+
+    # ── 线索词 ──
+    check(history_mod.looks_like_lookup("昨天那个游戏后来怎么样"), "「昨天」触发翻记录")
+    check(history_mod.looks_like_lookup("你上次说的那个"), "「上次」触发翻记录")
+    check(history_mod.looks_like_lookup("还记得吗"), "「还记得吗」触发翻记录")
+    check(not history_mod.looks_like_lookup("今天天气不错"), "没有指名过去就不翻")
+    check(not history_mod.looks_like_lookup(""), "空串不翻")
+    check(not history_mod.looks_like_lookup("好"), "太短的不翻")
+
+    # ── L2 检索 ──
+    history_rows = [
+        {"id": 1, "ts": yesterday, "speaker": "阿岚", "text": "周末要不要一起去看那部新上映的科幻电影"},
+        {"id": 2, "ts": yesterday, "speaker": "小满", "text": "好啊好啊我一直想看那个"},
+        {"id": 3, "ts": yesterday, "speaker": "阿岚", "text": "今天食堂的菜好难吃"},
+    ]
+    hits = history_mod.pick_history_hits(
+        "我们上次说的那部科幻电影还去吗", history_rows, threshold=0.2
+    )
+    check(len(hits) >= 1, "能翻到相关的记录")
+    check(hits[0]["id"] == 1, "最相关的那条排第一")
+    check(
+        history_mod.pick_history_hits("完全无关的内容", history_rows, threshold=0.9) == [],
+        "门槛过高时翻不到",
+    )
+    check(history_mod.pick_history_hits("", history_rows) == [], "空消息不检索")
+
+    formatted = history_mod.format_hit(history_rows[0], now=now)
+    check("阿岚" in formatted, "翻到的记录带发言人")
+    check("科幻电影" in formatted, "翻到的记录带正文")
+    check("昨天" in formatted, "翻到的记录带日期")
+
+    # ── L2 / L3 渲染 ──
+    found = history_mod.render_lookup_block(hits, now=now)
+    check("companion-lookup" in found, "翻到时有标记")
+    check("科幻电影" in found, "翻到时给出原文")
+    empty = history_mod.render_lookup_block([], now=now)
+    check("companion-lookup" in empty, "**翻不到时也要有提示**（L3，否则模型会编）")
+    check("没有找到" in empty, "翻不到时明说没找到")
+    check(history_mod.render_lookup_block(hits, max_chars=120, now=now) != "", "小预算也能渲染")
+
+    # ── 反向断言：这些数字决定「翻多少」和「存多久」 ──
+    check(history_mod.DEFAULT_RECALL_LIMIT <= 5, "一次翻出来不超过 5 条（再多就是通读）")
+    check(history_mod.DEFAULT_RECALL_SIMILARITY < 0.40, "翻记录门槛低于记忆的 0.40（消息更长）")
+    check(history_mod.MAX_HOLE_ROWS >= 100, "原文至少留得下 100 条")
+
+
 # ── 主流程 ──
 
 async def main() -> None:
@@ -4597,6 +5349,10 @@ async def main() -> None:
         test_log()
         test_absence()
         test_boundary()
+        test_presence()
+        test_initiative()
+        test_backfill()
+        test_history()
         await test_energy_gate(tmp)
     finally:
         for store in list(_OPEN_STORES):

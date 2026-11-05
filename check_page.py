@@ -1097,6 +1097,122 @@ if (bad.length) { console.error(bad.join('\\n')); process.exit(1); }
         "遮罩关闭用查表实现（否则新弹窗会被最后一个分支误关成情绪弹窗）",
     )
 
+    print("[16] 折叠 / 分页 / 分段切换")
+    # 用户第 43 轮：「给认识的人也用同样的模式折叠一下，每页五个」
+    # 「喜好模块我觉得也可以折叠一下」。
+    # 折叠的意义不是省空间，是让「记忆」不用滚很久才看得到 —— 记忆才是
+    # 这个页面最常看的东西，而人物卡片和喜好行都比记忆条目高得多。
+    for panel_id, fold_id, body_id in (
+        ("cg-people", "cg-people-fold", "cg-people-body"),
+        ("cg-prefs", "cg-prefs-fold", "cg-prefs-body"),
+    ):
+        check(
+            f'id="{fold_id}"' in html and f'id="{body_id}"' in html,
+            f"{panel_id} 有折叠按钮与可折叠的内容容器",
+        )
+        check(
+            f'aria-controls="{body_id}"' in html and "aria-expanded" in html,
+            f"{panel_id} 的折叠按钮带 aria 关联与展开状态",
+        )
+    # 默认折叠：两块都是「看一眼知道大概就够」的信息，展开才有内容。
+    check(
+        'class="cg-panel cg-people folded"' in html,
+        "「认识的人」默认折叠",
+    )
+    check(
+        'class="cg-panel cg-prefs folded"' in html,
+        "「喜好」默认折叠",
+    )
+    check(
+        ".cg-panel.folded .cg-panel-body" in html and "display: none" in html,
+        "折叠用 CSS 藏内容而不是重排 DOM",
+    )
+    # 折叠时「新增」按钮一起藏起来：看不见内容却还能点新增，会让人以为是
+    # 新建到了别的地方。
+    check(
+        ".cg-panel.folded .cg-panel-act" in html,
+        "折叠时标题行右侧的操作按钮一起收起",
+    )
+    # 折叠状态不落 localStorage：每次打开都该是整洁的默认态。
+    # 注意只查真实调用（setItem/getItem/removeItem），不查关键字 ——
+    # 上面那条 CSS 注释里就写着「不写 localStorage」，按关键字查会把自己绊倒。
+    check(
+        "localStorage.setItem" not in html
+        and "localStorage.getItem" not in html
+        and "localStorage.removeItem" not in html,
+        "折叠状态不写 localStorage（每次打开都是默认态）",
+    )
+    check(
+        "function toggleFold" in html,
+        "折叠逻辑抽成了一个函数（两块面板共用）",
+    )
+
+    # 人物分页：每页 5 个。一张人物卡片比一条记忆高得多，
+    # 10 张叠起来一屏放不下，翻页就失去意义。
+    check(
+        "PEOPLE_PAGE_SIZE = 5" in html,
+        "人物每页 5 个",
+    )
+    check(
+        "function renderPeoplePage" in html and "peopleState.all" in html,
+        "人物分页是客户端切片（查一次全量再切）",
+    )
+    check(
+        "Math.ceil(all.length / peopleState.limit)" in html,
+        "人物页数由总数算出，不写死",
+    )
+    # 删掉最后一个之后 offset 会越界，不钳回去就渲染出空白页。
+    check(
+        "page >= pages" in html and "peopleState.offset = page * peopleState.limit" in html,
+        "删空最后一页后把 offset 钳回有效页（否则空白页）",
+    )
+    check(
+        'id="cg-people-pager"' in html and "cg-people-prev" in html and "cg-people-next" in html,
+        "人物面板有上一页 / 下一页",
+    )
+    check(
+        "all.length <= peopleState.limit" in html,
+        "一页就能装下时隐藏分页器",
+    )
+
+    # 喜好分段按钮，不做左右分栏。
+    check(
+        'id="cg-prefs-seg"' in html and 'role="tablist"' in html,
+        "喜好用分段按钮切换，不是左右分栏",
+    )
+    check(
+        'id="cg-prefs-tab-like"' in html and 'id="cg-prefs-tab-dislike"' in html,
+        "喜欢 / 讨厌两个页签都在",
+    )
+    # 按钮上带条数：不点开也知道对面有几条，这是选择分段而非分栏后
+    # 唯一丢掉的信息，必须补回来。
+    check(
+        'id="cg-prefs-n-like"' in html and 'id="cg-prefs-n-dislike"' in html,
+        "两个页签上各带一个条数",
+    )
+    check(
+        "function setPrefTab" in html and 'aria-selected' in html,
+        "切换页签同步更新 aria-selected",
+    )
+    check(
+        "var prefTab = 'like'" in html,
+        "默认停在「喜欢」（实测 16 喜欢 / 4 讨厌，打开就落在信息多的一边）",
+    )
+    # 从「讨厌」页点新增，默认就该是讨厌 —— 刚在看的类别就是要加的类别。
+    check(
+        "$('cg-pref-new-kind').value = prefTab" in html,
+        "新增喜好时默认选当前页签的类别",
+    )
+    check(
+        ".cg-seg-btn.is-on" in html and "var(--cg-panel-image)" in html,
+        "选中态用不透明底色 + surface 叠加（future-retro 下不会透明）",
+    )
+    # 折叠后标题行的摘要必须自己说清楚两边的量 —— 折起来只剩这一句。
+    check(
+        "'喜欢 ' + likes + ' / 讨厌 ' + dislikes" in html,
+        "折叠时标题行摘要仍写全两边的数量",
+    )
+
     print()
     if _failures:
         print(f"失败 {len(_failures)} 项 / 共 {_checks} 项检查")

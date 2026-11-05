@@ -33,6 +33,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -749,6 +750,11 @@ def main() -> int:
             "M.action('pref_create'", "M.action('pref_update'", "M.action('pref_delete'",
             # 第 44 轮：人物卡片与弹窗都要显示账号（QQ 号）
             "accountText", "platformLabel", "cg-person-id", "cg-person-in-account",
+            # 第 45 轮：「认识的人」「喜好」可折叠，人物分页每页 5 个，喜好分两个页签
+            "cg-people-fold", "cg-people-body", "cg-people-pager",
+            "cg-prefs-fold", "cg-prefs-body", "cg-prefs-seg",
+            "cg-prefs-tab-like", "cg-prefs-tab-dislike",
+            "PEOPLE_PAGE_SIZE = 5", "function toggleFold",
         ):
             check(needle in document, f"页面文档含 {needle}")
 

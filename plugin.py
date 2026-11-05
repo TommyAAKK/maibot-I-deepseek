@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import uuid
@@ -53,9 +54,18 @@ try:
 except Exception:  # pragma: no cover
     _HOOK_ENUMS = False
 
-from .cg_absence import absence_level, absence_seconds, render_absence_note
+from .cg_absence import absence_level, absence_seconds, describe_gap, render_absence_note
 from .cg_avoidance import AvoidanceProbe
 from . import cg_log
+from .cg_backfill import (
+    BackfillResult,
+    default_since,
+    describe_result,
+    fetch_friend_history,
+    fetch_group_history,
+    merge_messages,
+    should_backfill,
+)
 from .cg_boundary import (
     SILENCE_MODE_SILENT,
     SILENCE_MODE_TACITURN,
@@ -76,6 +86,20 @@ from .cg_compose import (
 )
 from .cg_config_model import CONFIG_VERSION, CompanionGapConfig
 from .cg_energy_gate import EnergyGate
+from .cg_history import (
+    as_float as history_as_float,
+    looks_like_lookup,
+    message_stamp,
+    pick_history_hits,
+    render_lookup_block,
+    render_unread_note,
+)
+from .cg_initiative import (
+    Decision,
+    describe as describe_initiative,
+    evaluate as evaluate_initiative,
+    filter_tools,
+)
 from .cg_mood import MoodEngine, render_block as render_mood_block
 from .cg_person import (
     AXIS_KEYS,
@@ -101,6 +125,13 @@ from .cg_prefs import (
     prefs_key,
     render_prefs_block,
 )
+from .cg_presence import (
+    Presence,
+    analyse as analyse_presence,
+    describe_presence,
+    fetch_online_windows,
+    render_away_note,
+)
 from .cg_store import GapStore, recall_score
 from .cg_tracker import SessionTracker
 from .cg_webui import MemoryAdminMixin
@@ -114,6 +145,10 @@ INJECT_TIMEOUT_MS = 2500
 
 #: 观察 hook 的超时预算。mark_dirty 只改内存，1000ms 足够。
 CAPTURE_TIMEOUT_MS = 1000
+
+#: 在线时段缓存的存活时间。宿主 ``online_time`` 的粒度本来就是 5 分钟，
+#: 每次注入都重新查一遍（30 天约 8600 行）纯属浪费。
+_ONLINE_CACHE_SECONDS = 600.0
 
 _CAPTURE_KW: dict[str, Any] = {
     "name": "capture_message",
@@ -237,6 +272,12 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         self._probe: AvoidanceProbe | None = None
         self._mood: MoodEngine | None = None
         self._gate: EnergyGate | None = None
+        # 在场判据的在线时段缓存：合并后的区间列表，以及下次该重新读的时间。
+        # 由后台任务 _online_loop 维护，注入路径只读不写（注入只有 2500ms 预算）。
+        self._online_windows: list[Any] = []
+        self._online_windows_at: float = 0.0
+        self._online_stop = asyncio.Event()
+        self._online_task: asyncio.Task[Any] | None = None
 
     # ── 配置 ──
 
@@ -300,7 +341,26 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         if not cfg.plugin.enabled:
             self._info("配置里 plugin.enabled=false，采集与注入都不会生效")
 
+        # 在线时段缓存：注入路径绝对不能查库（只有 2500ms 预算），所以由
+        # 后台任务每 10 分钟刷一次，注入时只读内存。启动时先同步跑一遍，
+        # 否则第一次注入时缓存是空的，缺席判据会悄悄退回旧算法。
+        try:
+            await self._refresh_online_windows()
+        except Exception as exc:  # noqa: BLE001 - 拿不到就退回旧算法
+            self._warn(f"启动时读取在线时段失败（缺席判据退回旧算法）: {exc!r}")
+        self._online_stop.clear()
+        self._online_task = asyncio.create_task(self._online_loop(), name="companion_gap_online")
+
     async def on_unload(self) -> None:
+        online_task = self._online_task
+        self._online_task = None
+        self._online_stop.set()
+        if online_task is not None and not online_task.done():
+            online_task.cancel()
+            try:
+                await online_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - 关闭阶段不抛
+                pass
         tracker = self._tracker
         self._tracker = None
         if tracker is not None:
@@ -493,64 +553,240 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         写入方式是往 ``items`` 里追加一条 SystemMessageItem ——和
         ``Alcpare_identity`` 用的是同一套写法（宿主允许改 items 的前提是
         ``item_schema_version`` 原样回传、item_id 唯一）。
+
+        **两件事共用这一个 hook，但互不依赖**：边界感那段文字（默认可关）
+        和自主发言闸门（默认关，收紧 ``tool_definitions``）。所以下面拆成
+        两个 try 块——任何一边失败或提前返回，都不能连带把另一边也跳过。
         """
 
         out = dict(kwargs)
         try:
-            cfg = self.config
-            store = self._store
-            boundary_cfg = getattr(cfg, "boundary", None)
-            if store is None or boundary_cfg is None:
-                return {"action": "continue", "modified_kwargs": out}
-            if not bool(getattr(boundary_cfg, "enabled", False)):
-                return {"action": "continue", "modified_kwargs": out}
-            if not bool(getattr(boundary_cfg, "note_enabled", False)):
-                return {"action": "continue", "modified_kwargs": out}
-            if not bool(getattr(boundary_cfg, "note_to_planner", False)):
-                return {"action": "continue", "modified_kwargs": out}
-
-            session_id = str(kwargs.get("session_id") or "").strip()
-            if not session_id:
-                return {"action": "continue", "modified_kwargs": out}
-
-            # 复用 replyer 那条路的渲染逻辑：同一份状态，两处共用，
-            # 免得 planner 和 replyer 对「她现在什么心情」给出两种说法。
-            note, _mode = self._render_boundary(session_id, cfg, kwargs)
-            if not note:
-                return {"action": "continue", "modified_kwargs": out}
-
-            items = out.get("items")
-            if not isinstance(items, list):
-                return {"action": "continue", "modified_kwargs": out}
-
-            appended = False
-            for item in reversed(items):
-                if isinstance(item, dict) and item.get("item_type") == "system":
-                    parts = item.get("parts")
-                    if not isinstance(parts, list):
-                        parts = []
-                        item["parts"] = parts
-                    parts.append({"type": "text", "text": note})
-                    appended = True
-                    break
-            if not appended:
-                items.insert(
-                    0,
-                    {
-                        "item_type": "system",
-                        "meta": {
-                            "item_id": f"companion-gap-boundary-{uuid.uuid4().hex}",
-                            "logical_turn_id": None,
-                            "timestamp": datetime.now().astimezone().isoformat(),
-                        },
-                        "parts": [{"type": "text", "text": note}],
-                    },
-                )
-            self._debug(f"planner 状态已注入（{len(note)} 字）")
+            out = self._inject_planner_boundary(out, **kwargs)
         except Exception as exc:  # noqa: BLE001 - planner 注入失败绝不能拖累决策
             self._warn(f"planner 状态注入失败: {exc!r}")
-            return {"action": "continue", "modified_kwargs": dict(kwargs)}
+
+        # ── 自主发言闸门 ──────────────────────────────────────────────
+        # 必须**无条件**跑：它改的是工具清单，和上面有没有注入哪段文字无关。
+        try:
+            out = self._apply_initiative_gate(out, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - 闸门失败退回「放行」
+            self._warn(f"自主发言闸门失败（退回放行）: {exc!r}")
         return {"action": "continue", "modified_kwargs": out}
+
+    def _inject_planner_boundary(self, out: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        """把边界感的状态提示追加进 planner 的 items（可关）。"""
+
+        cfg = self.config
+        store = self._store
+        boundary_cfg = getattr(cfg, "boundary", None)
+        if store is None or boundary_cfg is None:
+            return out
+        if not bool(getattr(boundary_cfg, "enabled", False)):
+            return out
+        if not bool(getattr(boundary_cfg, "note_enabled", False)):
+            return out
+        if not bool(getattr(boundary_cfg, "note_to_planner", False)):
+            return out
+
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if not session_id:
+            return out
+
+        # 复用 replyer 那条路的渲染逻辑：同一份状态，两处共用，
+        # 免得 planner 和 replyer 对「她现在什么心情」给出两种说法。
+        note, _mode = self._render_boundary(session_id, cfg, kwargs)
+        if not note:
+            return out
+
+        items = out.get("items")
+        if not isinstance(items, list):
+            return out
+
+        appended = False
+        for item in reversed(items):
+            if isinstance(item, dict) and item.get("item_type") == "system":
+                parts = item.get("parts")
+                if not isinstance(parts, list):
+                    parts = []
+                    item["parts"] = parts
+                parts.append({"type": "text", "text": note})
+                appended = True
+                break
+        if not appended:
+            items.insert(
+                0,
+                {
+                    "item_type": "system",
+                    "meta": {
+                        "item_id": f"companion-gap-boundary-{uuid.uuid4().hex}",
+                        "logical_turn_id": None,
+                        "timestamp": datetime.now().astimezone().isoformat(),
+                    },
+                    "parts": [{"type": "text", "text": note}],
+                },
+            )
+        self._debug(f"planner 状态已注入（{len(note)} 字）")
+        return out
+
+    def _apply_initiative_gate(self, out: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        """按「兴趣 / 好感度 / 心情」决定这一轮要不要开口。
+
+        **唯一有效的硬手段是把 ``reply`` 从工具清单里删掉。** 宿主的发言频率
+        只管「什么时候触发 Planner」，管不了「Planner 跑起来之后要不要说」；
+        而本会话开着 focus 模式时频率被硬编码成 1.0、空闲退避也失效，于是
+        看到啥都要回。插件没有能力 abort 一轮发言，只能把工具收走——模型
+        不是「被劝别说」，是**没有说的手段**。
+
+        判定顺序（硬过滤在前，软评分在后）：开关 → @/提及 → 能耗尽 →
+        边界感 → 软评分。每次判定都写日志，因为主动功能最难排查的就是
+        「它为什么不说话」。
+        """
+
+        out_kwargs = dict(out)
+        cfg = self.config
+        initiative_cfg = getattr(cfg, "initiative", None)
+        tracker = self._tracker
+        store = self._store
+        if initiative_cfg is None or tracker is None or store is None:
+            return out_kwargs
+        if not bool(getattr(initiative_cfg, "enabled", False)):
+            return out_kwargs
+
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if not session_id:
+            return out_kwargs
+
+        # 被 @ / 被提到：时间窗内发生过就算（见 tracker.recent_attention）。
+        at_pending, mentioned_pending = tracker.recent_attention(session_id)
+
+        # 能耗尽：复用情绪引擎的两档（voice_level 的 0.0 档）。
+        exhausted = False
+        try:
+            if self._mood is not None:
+                exhausted = not self._mood.can_initiate()
+        except Exception as exc:  # noqa: BLE001 - 读不到就当没耗尽
+            self._debug(f"读取精力状态失败（按未耗尽处理）: {exc!r}")
+
+        # 边界感的沉默判定：主动和边界感必须共用同一个闸门，
+        # 不能一边注入「你现在不太想接话」一边又允许她主动开口。
+        boundary_silent = False
+        try:
+            note, silence_mode = self._render_boundary(session_id, cfg, kwargs)
+            boundary_silent = bool(silence_mode)
+            _ = note
+        except Exception as exc:  # noqa: BLE001 - 判不出来就不拦
+            self._debug(f"边界感沉默判定失败（按未沉默处理）: {exc!r}")
+
+        # 心情与关系：给软评分用。
+        valence = 0.0
+        arousal = 0.5
+        energy = 1.0
+        try:
+            if self._mood is not None:
+                snapshot = self._mood.snapshot()
+                valence = float(getattr(snapshot, "valence", 0.0) or 0.0)
+                arousal = float(getattr(snapshot, "arousal", 0.5) or 0.5)
+                energy = float(getattr(snapshot, "energy", 1.0) or 1.0)
+        except Exception as exc:  # noqa: BLE001
+            self._debug(f"读取情绪快照失败（用中性值）: {exc!r}")
+
+        affection = 0.0
+        who = "对方"
+        try:
+            state = store.get_state(session_id) or {}
+            key = person_key(str(state.get("platform") or ""), str(state.get("user_id") or ""))
+            if key:
+                person = store.get_person(key)
+                if person is not None:
+                    affection = float(person.get("affection") or 0.0)
+                    who = str(person.get("display_name") or "").strip() or who
+        except Exception as exc:  # noqa: BLE001 - 拿不到关系按陌生处理
+            self._debug(f"读取关系失败（按陌生处理）: {exc!r}")
+
+        # 当前这轮要说的话：从 planner 的 items 里捞最近的用户文本。
+        text = self._planner_user_text(kwargs)
+        likes = self._liked_topics(store)
+
+        decision: Decision = evaluate_initiative(
+            enabled=True,
+            at_pending=at_pending,
+            mentioned_pending=mentioned_pending,
+            at_always_reply=bool(getattr(initiative_cfg, "at_always_reply", True)),
+            mentioned_always_reply=bool(getattr(initiative_cfg, "mentioned_always_reply", False)),
+            exhausted=exhausted,
+            boundary_silent=boundary_silent,
+            text=text,
+            likes=likes,
+            affection=affection,
+            valence=valence,
+            arousal=arousal,
+            energy=energy,
+            threshold=float(getattr(initiative_cfg, "threshold", 0.45) or 0.45),
+        )
+
+        drop: tuple[str, ...] = ("reply",)
+        if bool(getattr(initiative_cfg, "gate_send_emoji", True)):
+            drop = ("reply", "send_emoji")
+
+        kept, removed = filter_tools(
+            kwargs.get("tool_definitions"),
+            allow_reply=decision.allow,
+            drop=drop,
+        )
+        if bool(getattr(initiative_cfg, "log_decisions", True)):
+            tail = f"；已收回 {', '.join(removed)}" if removed else ""
+            self._debug(f"自主发言：{describe_initiative(decision)}（{who}）{tail}")
+        if kept is None:
+            # 工具清单形态不认识 —— **看不懂就别改**，这比猜测性地清空安全得多。
+            return out_kwargs
+        out_kwargs["tool_definitions"] = kept
+        return out_kwargs
+
+    @staticmethod
+    def _planner_user_text(kwargs: dict[str, Any]) -> str:
+        """从 planner 的 ``items`` 里取出最近的用户文本，用于兴趣匹配。"""
+
+        items = kwargs.get("items")
+        if not isinstance(items, list):
+            return ""
+        chunks: list[str] = []
+        for item in reversed(items):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("item_type") or "") == "system":
+                continue
+            parts = item.get("parts")
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                if str(part.get("type") or "") != "text":
+                    continue
+                value = part.get("text")
+                if isinstance(value, str) and value.strip():
+                    chunks.append(value.strip())
+            if chunks:
+                break
+        return "\n".join(reversed(chunks))
+
+    def _liked_topics(self, store: GapStore) -> list[str]:
+        """她「喜欢」的口味词，用于兴趣匹配。
+
+        ``list_prefs`` 返回时已按强度降序，这里自己按 ``min_strength`` 过滤——
+        强度 0.1 的口味拿去算兴趣匹配只会把「喜欢」稀释成噪音。
+        """
+
+        try:
+            rows = store.list_prefs(kind="like", limit=24)
+        except Exception as exc:  # noqa: BLE001 - 拿不到就不做兴趣加权
+            self._debug(f"读取口味失败（不做兴趣加权）: {exc!r}")
+            return []
+        return [
+            str(row.get("topic") or "").strip()
+            for row in rows
+            if row.get("topic") and float(row.get("strength") or 0.0) >= 0.35
+        ][:12]
 
     @HookHandler("maisaka.replyer.before_request", **_INJECT_KW)
     async def inject_context(self, **kwargs: Any) -> dict[str, Any]:
@@ -628,7 +864,7 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
             # 是背景情绪，不该挤掉具体记得的事。
             absence_text = ""
             try:
-                absence_text = self._render_absence(session_id, cfg)
+                absence_text = await self._render_absence(session_id, cfg)
             except Exception as exc:  # noqa: BLE001 - 缺席感失败不影响回复
                 self._warn(f"缺席感渲染失败（已跳过）: {exc!r}")
 
@@ -660,6 +896,27 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
             except Exception as exc:  # noqa: BLE001 - 口味失败不影响记忆注入
                 self._warn(f"喜好注入失败（已跳过）: {exc!r}")
 
+            # 未读历史（L1 / L2-L3）。
+            #
+            # L1「你不在的时候这儿有 N 条」：只给条数和时间，让她知道自己错过
+            # 了什么。这一段必须排在记忆之前——先知道「我不在」，后面的记忆才
+            # 不会被当成「我一直都在看着」。
+            #
+            # L2/L3「翻记录」也是两段独立文本：翻到了给原文，翻不到明说没找到。
+            unread_text = ""
+            unread_used: list[dict[str, Any]] = []
+            try:
+                unread_text, unread_used = self._render_unread(session_id, cfg, kwargs)
+            except Exception as exc:  # noqa: BLE001 - 未读失败不影响回复
+                self._warn(f"未读历史渲染失败（已跳过）: {exc!r}")
+
+            lookup_text = ""
+            lookup_used: list[dict[str, Any]] = []
+            try:
+                lookup_text, lookup_used = self._render_lookup(session_id, cfg, kwargs)
+            except Exception as exc:  # noqa: BLE001 - 翻记录失败不影响回复
+                self._warn(f"翻聊天记录失败（已跳过）: {exc!r}")
+
             # 统一拼接。顺序即重要性：情绪 → 边界 → 缺席 → 人物 → 记忆
             # → 跨流 → 想起 → 口味。原来这里是层层嵌套的三元式，每加一段就要
             # 重写一次，加到最后没人敢动；改成一次性列表拼接。
@@ -667,6 +924,8 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
                 mood_text,
                 boundary_text,
                 absence_text,
+                unread_text,
+                lookup_text,
                 people_text,
                 block,
                 cross_text,
@@ -722,8 +981,19 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
                 self._debug(
                     f"注入 {len(used)} 条 + 跨流 {len(cross_used)} 条 / "
                     f"人物 {len(people_used)} 个 / 想起 {len(recall_used)} 条 / "
-                    f"口味 {len(prefs_used)} 条 / {len(merged)} 字 / {elapsed_ms:.1f}ms"
+                    f"口味 {len(prefs_used)} 条 / 未读 {len(unread_used)} 段 / "
+                    f"翻到 {len(lookup_used)} 条 / {len(merged)} 字 / {elapsed_ms:.1f}ms"
                 )
+
+            # 洞已经跟她讲过了，标一下：同一段时间不必每轮都重复提。
+            # 放在最后 —— 只有真的写进 extra_prompt 才算「讲过了」。
+            if unread_used and unread_text:
+                try:
+                    store.mark_unread_used(
+                        [int(row.get("id") or 0) for row in unread_used if row.get("id")]
+                    )
+                except Exception as exc:  # noqa: BLE001 - 记账失败不影响回复
+                    self._warn(f"标记未读已讲失败: {exc!r}")
         except Exception as exc:  # noqa: BLE001 - 注入失败就放行，不拖累回复
             self._warn(f"inject_context 失败: {exc!r}")
             return {"action": "continue", "modified_kwargs": dict(kwargs)}
@@ -990,6 +1260,128 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
             allow_deference=self._deference_allowed(session_id, cfg, kwargs),
         )
 
+    def _render_unread(
+        self, session_id: str, cfg: Any, kwargs: dict[str, Any]
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """L1：告诉她「你不在的时候这儿有 N 条」。
+
+        **只给条数和时间范围，不给内容。** 这是整个功能的关键取舍：一旦给了
+        内容，她就从「那会儿我不在」变成「其实我都看过」——那正是用户嫌弃的
+        那种假装。反过来，只给一个数字，她就只能诚实地说「你们昨晚聊了两百条？
+        我一条都没看到」。
+
+        Returns:
+            ``(text, used_gaps)``；空字符串表示这段时间没有洞。
+        """
+
+        history_cfg = getattr(cfg, "history", None)
+        if history_cfg is None or not bool(getattr(history_cfg, "enabled", True)):
+            return "", []
+        if not bool(getattr(history_cfg, "inject_unread", True)):
+            return "", []
+
+        store = self._store
+        if store is None:
+            return "", []
+
+        try:
+            state = store.get_state(session_id) or {}
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"读取会话状态失败（未读历史）: {exc!r}")
+            return "", []
+
+        # 刚聊完就别提「你刚才不在」——那是噪音。
+        gaps = []
+        try:
+            gaps = store.list_unread(session_id, limit=4)
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"读取未读洞失败: {exc!r}")
+            return "", []
+        if not gaps:
+            return "", []
+
+        chat_type = str(state.get("chat_type") or "").strip().lower()
+        who = self._person_label(state)
+        text = render_unread_note(
+            gaps,
+            chat_type=chat_type,
+            who=who,
+            max_chars=int(getattr(history_cfg, "unread_max_chars", 180) or 180),
+        )
+        return text, gaps if text else []
+
+    def _render_lookup(
+        self, session_id: str, cfg: Any, kwargs: dict[str, Any]
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """L2 / L3：对方提到过去的事时，翻记录。
+
+        触发条件是 ``looks_like_lookup``（「昨天」「上次」「说过」这类词），
+        和「想起遗忘记忆」用的是同一个思路：**对方的原话**才是钩子，不是时间、
+        不是随机数。
+
+        L3 同样重要：翻了但没找到时也必须返回提示，否则模型会顺着上下文把
+        「昨天那个」编下去。她得知道自己翻了、并且没翻到。
+
+        为什么仍然不调 LLM：跑在 replyer 的 ``before_request`` 里，6000ms 预算。
+        """
+
+        history_cfg = getattr(cfg, "history", None)
+        if history_cfg is None or not bool(getattr(history_cfg, "enabled", True)):
+            return "", []
+        if not bool(getattr(history_cfg, "lookup_enabled", True)):
+            return "", []
+
+        store = self._store
+        if store is None:
+            return "", []
+
+        message = self._current_message(kwargs)
+        if not looks_like_lookup(message):
+            return "", []
+
+        limit = int(getattr(history_cfg, "lookup_limit", 3) or 3)
+        threshold = float(getattr(history_cfg, "lookup_similarity", 0.34) or 0.34)
+        try:
+            rows = store.search_history(session_id, limit=400)
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"读取历史原文失败（翻记录已跳过）: {exc!r}")
+            return "", []
+        if not rows:
+            # 从来没存过原文 → 不是「翻了没找到」，是「没得翻」，什么都不说
+            return "", []
+
+        hits = pick_history_hits(message, rows, limit=limit, threshold=threshold)
+        if hits:
+            try:
+                store.mark_history_looked([int(hit["id"]) for hit in hits if hit.get("id")])
+            except Exception as exc:  # noqa: BLE001
+                self._debug(f"标记翻看时间失败: {exc!r}")
+            self._debug(f"翻到 {len(hits)} 条历史记录（线索：{message[:24]}）")
+
+        text = render_lookup_block(hits, max_chars=420)
+        return text, hits
+
+    def _person_label(self, state: dict[str, Any]) -> str:
+        """取「对方」在这段会话里该怎么称呼——用于缺席感/未读提示里的第三人称。"""
+
+        who = "对方"
+        store = self._store
+        if store is None:
+            return who
+        try:
+            platform = str(state.get("platform") or "qq")
+            user_id = str(state.get("user_id") or "")
+            if not user_id:
+                return who
+            person = store.get_person(person_key(platform, user_id))
+        except Exception:  # noqa: BLE001 - 取不到就用默认
+            return who
+        if person:
+            name = str(person.get("display_name") or person.get("nickname") or "").strip()
+            if name:
+                return name
+        return who
+
     def _render_prefs(self, cfg: Any) -> tuple[str, list[dict[str, Any]]]:
         """渲染「她自己的口味」这一块。
 
@@ -1031,7 +1423,117 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
             min_strength=float(getattr(prefs_cfg, "min_strength", 0.35) or 0.35),
         )
 
-    def _render_absence(self, session_id: str, cfg: Any) -> str:
+    async def _presence_of(self, state: dict[str, Any], cfg: Any) -> Presence | None:
+        """算出这个会话的「在场解剖」；读不到在线数据时返回 ``None``。
+
+        返回 ``None`` 的含义是「**不知道**她当时在不在」——调用方据此退回旧算法
+        （一律按「对方没来」处理）。这是刻意的：读不到在线时段时如果把离线时长
+        猜成 0，那等于假设她一直醒着；猜成「全都不在」，又会把所有缺席感抹平。
+        都不对，所以退回原样。
+
+        **只读缓存，不查库**：在线时段由 :meth:`_refresh_online_windows` 在
+        后台任务里每 10 分钟刷一次。注入 hook 只有 2500ms 预算，在这里等一次
+        8600 行的查询是拿回复速度换一个本来就不精确的判据，不值。
+        """
+
+        presence_cfg = getattr(cfg, "presence", None)
+        if presence_cfg is None or not bool(getattr(presence_cfg, "enabled", False)):
+            return None
+
+        windows = self._online_windows
+        if not windows:
+            return None
+
+        try:
+            pending = int(state.get("pending_count") or 0)
+        except (TypeError, ValueError):
+            pending = 0
+
+        presence = analyse_presence(
+            last_seen_ts=state.get("last_seen_ts"),
+            windows=windows,
+            pending=pending,
+            offline_dominant=float(getattr(presence_cfg, "offline_dominant", 0.5) or 0.5),
+            min_hours=float(
+                getattr(getattr(cfg, "absence", None), "min_hours", 6.0) or 6.0
+            ),
+        )
+        self._debug(f"在场判据：{describe_presence(presence)}")
+        return presence
+
+    async def _refresh_online_windows(self) -> None:
+        """后台刷新在线时段缓存（10 分钟一次，失败就保留上一次的结果）。"""
+
+        cfg = self.config
+        presence_cfg = getattr(cfg, "presence", None)
+        if presence_cfg is None or not bool(getattr(presence_cfg, "enabled", False)):
+            return
+        try:
+            windows = await fetch_online_windows(
+                self.ctx,
+                days=float(getattr(presence_cfg, "online_days", 30.0) or 30.0),
+                logger=self.ctx.logger,
+            )
+        except Exception as exc:  # noqa: BLE001 - 读不到就维持上一次的结果
+            self._debug(f"刷新在线时段失败（沿用上一次结果）: {exc!r}")
+            return
+        if not windows:
+            # 空结果可能是「宿主这张表还没写过」，也可能是读失败。两种情况都
+            # 不该把已有缓存清掉——清掉等于让缺席判据悄悄退回旧算法。
+            self._debug("在线时段为空（保持上一次结果）")
+            return
+        self._online_windows = windows
+        self._online_windows_at = time.time()
+        self._debug(f"在线时段已刷新：{len(windows)} 段区间")
+
+    async def _online_loop(self) -> None:
+        """后台任务：周期性刷新在线时段，直到插件卸载。"""
+
+        while not self._online_stop.is_set():
+            try:
+                await self._refresh_online_windows()
+            except Exception as exc:  # noqa: BLE001 - 后台任务绝不能死
+                self._debug(f"在线时段刷新循环异常（继续）: {exc!r}")
+            try:
+                await asyncio.wait_for(self._online_stop.wait(), timeout=_ONLINE_CACHE_SECONDS)
+            except asyncio.TimeoutError:
+                continue
+            except Exception:  # noqa: BLE001
+                return
+
+    def _render_presence_shift(self, presence: Presence, chat_type: str, cfg: Any) -> str:
+        """渲染「那段时间我不在 / 有待补消息」的提示。
+
+        这两种情况和「你冷落我」是**相反**的语义，所以不能走
+        ``render_absence_note``——那套措辞全在暗示「对方没来」。
+        """
+
+        presence_cfg = getattr(cfg, "presence", None)
+        if presence_cfg is None or not bool(getattr(presence_cfg, "away_enabled", True)):
+            return ""
+
+        if presence.level == "pending":
+            # 有待补消息：那段时间她没看见的东西还没抽取。这时候提「好久没见」
+            # 是拿没读过的消息当感情依据，很假。让后台先把洞补上。
+            self._debug(f"在场判据：有待补消息，这轮不注入缺席感（{describe_presence(presence)}）")
+            return ""
+
+        if presence.level != "away":
+            return ""
+
+        absence_cfg = getattr(cfg, "absence", None)
+        max_chars = int(getattr(absence_cfg, "max_chars", 60) or 60)
+        header = str(getattr(absence_cfg, "inject_header", "") or "").strip() or "<companion-absence>"
+        footer = str(getattr(absence_cfg, "inject_footer", "") or "").strip() or "</companion-absence>"
+
+        how = describe_gap(presence.offline_hours)
+        note = render_away_note(hours=presence.offline_hours, how=how, chat_type=chat_type or "private")
+        if not note:
+            return ""
+        body = note[: max(1, max_chars - len(header) - len(footer) - 2)]
+        return f"{header}\n{body}\n{footer}"
+
+    async def _render_absence(self, session_id: str, cfg: Any) -> str:
         """渲染「多久没说话了」这一段。
 
         数据来自 ``gap_state.last_seen_ts``——它是**每次收到消息时**更新的
@@ -1044,6 +1546,10 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
           明确打开 ``absence.group_enabled`` 时才提，而且措辞不带情绪。
         - **需要真人关系的档位**。陌生人档位恒为 ``mild`` 且大多数时候返回
           空串——他为什么要在意一个陌生人多久没来。
+
+        在场判据（``presence.enabled``）会把总间隔拆成「她不在」和「对方没来」：
+        前者渲染成「我那段时间没在」，后者才是真正的缺席感。详见
+        :mod:`cg_presence` 的模块文档。
 
         Returns:
             渲染好的文本（含 ``<companion-absence>`` 标记）；空串表示不注入。
@@ -1075,6 +1581,21 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
             return ""
 
         hours = seconds / 3600.0
+
+        # ── 在场判据：把「多久没说话」拆成「她不在」和「对方没来」 ──────────
+        # 旧算法只有 hours 一个数，等于假设她一直醒着。用户每天 00:00 关机、
+        # 11:00 开机，于是上午开机后她看到「73 小时没说话」就说「你怎么这么久
+        # 没来」——可其中 33.8 小时是她自己不在。
+        presence = await self._presence_of(state, cfg)
+        if presence is not None:
+            if presence.level in {"away", "pending"}:
+                return self._render_presence_shift(presence, chat_type, cfg)
+            if presence.level == "none":
+                return ""
+            # level == "cold"：继续走原来的缺席感渲染，但用醒着的时长而不是总间隔。
+            hours = presence.awake_hours
+            if hours <= 0:
+                return ""
         # 关系亲疏决定「提不提、提得多重」：好感度从人物表拿（查不到就按 0 算，
         # 也就是「不熟」，只会得到最轻的档位或直接不提）。
         affection = 0.0

@@ -1,7 +1,10 @@
 """生成一个离线预览页，用于在无浏览器自动化的情况下肉眼校验 webui_page.html 的渲染。
 
 做法：
-  1. 用真实 token 调用宿主 HTTP 接口，抓取 stats / sessions / items 三个查询的真实返回；
+  1. 用真实 token 调用宿主 HTTP 接口，抓取 stats / sessions / items 等查询的真实返回；
+     **items 必须带 `status=active`** —— 页面默认筛选就是「只看活跃」，而按显著度
+     降序抓回来的前几十条几乎全是 resolved/expired（实测前 25 条里 21 条 resolved、
+     2 条 active），预览就会渲染出「列表内容过少」，看着像页面坏了，其实是喂错了数据；
   2. 把 webui_page.html 的**原始片段**（一字不改）包进一个完整 HTML 文档；
   3. 在 <head> 里注入一个桩 window.maibot，query() 直接返回第 1 步抓到的真实数据，
      action() 返回成功但不落库（预览只读，不会动真实记忆）；
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -65,10 +69,59 @@ def call(token: str, kind: str, name: str, args: dict) -> dict:
     return payload["result"]
 
 
+def pick_search_term(items: dict, *, max_hits: int = 8) -> str:
+    """从抓到的条目里挑一个「搜索一定搜得到、并且一定看得出变化」的关键词。
+
+    断言里写死关键词是个迟早会坏的做法：数据一变，断言就失效，而且失败信息
+    会指向页面（「搜索返回 0 条」），真正的原因却在数据里。这里改成从当前数据
+    里挑，让断言只校验「搜索这条链路通不通」，不校验「库里有没有 B 站」。
+
+    两条约束，都是被实跑教训过的：
+      - **至少要 2 个汉字**。单字几乎每条都命中，过滤前后看起来一样。
+      - **命中数要小于一页**（默认每页 10 条，这里留到 8）。命中的结果如果还
+        够填满一整页，页面上的卡片数不会变，`搜索后列表没有变化` 那条断言就
+        会失败——而页面其实工作得很好。这条是「每页 25 条改成 10 条」之后才
+        暴露出来的：以前一页 25 条，命中十几条也看得出变少。
+    """
+    rows = items.get("items") or []
+    counts: dict[str, int] = {}
+    for row in rows:
+        text = str(row.get("content") or "")
+        # 只数汉字串：英文/数字/emoji 在 toLowerCase 之后容易撞成一堆无意义匹配。
+        for run in re.findall(r"[\u4e00-\u9fff]{2,6}", text):
+            for size in range(2, len(run) + 1):
+                for start in range(0, len(run) - size + 1):
+                    word = run[start : start + size]
+                    counts[word] = counts.get(word, 0) + 1
+    if not counts:
+        return ""
+    total = len(rows)
+    # 首选：命中 2 条以上（不然太脆弱）、但少于一页（这样翻页断言才有变化）。
+    candidates = [
+        (word, hits)
+        for word, hits in counts.items()
+        if 1 < hits <= max_hits and hits < total
+    ]
+    if not candidates:
+        # 退一步：只要不是「全都命中」就行。此时卡数可能不变，但至少能验证
+        # 「发出了带 search 参数的查询」和「分页文案更新」两条断言。
+        candidates = [(word, hits) for word, hits in counts.items() if hits < total]
+    if not candidates:
+        return ""
+    # 越靠近「一页的一半」越好：太少看不清过滤效果，太多又会填满一页。
+    target = max(2, max_hits / 2)
+    candidates.sort(key=lambda pair: (abs(pair[1] - target), -len(pair[0])))
+    return candidates[0][0]
+
+
 STUB = """
 <script>
 (function () {
   var DATA = __DATA__;
+  // 搜索断言用的关键词，由 build_preview.py 从当前数据里挑出来写进去。
+  // 挂到 window 上是为了让 cdp_interact.js 能读到（它在页面上下文里 evaluate）。
+  // 空串表示这批数据里挑不出合适的词，此时 cdp_interact.js 会跳过搜索那一段。
+  window.__CGAP_SEARCH_TERM = '__SEARCH_TERM__';
   // 复刻 cg_webui.mem_items 的过滤 + 分页语义（含 _clamp_page_size/offset 的夹紧），
   // 让预览里的搜索、筛选、翻页都是真实行为，而不是每次都返回同一批数据。
   function clampSize(v) {
@@ -321,15 +374,21 @@ def main() -> int:
     token = read_token()
     print(f"token 长度 {len(token)}")
 
+    # items 必须按页面默认筛选抓：页面一进来就看「活跃」，抓到 resolved 的话
+    # 预览会渲染出「列表内容过少」，看着像页面坏了，其实是喂错了数据。
+    # limit 给 40 是为了让「每页 10 条」和人物分页（每页 5 个）都能翻出第二页。
+    items = call(token, "queries", "items", {"limit": 40, "status": "active"})
     data = {
         "stats": call(token, "queries", "stats", {}),
         "sessions": call(token, "queries", "sessions", {}),
-        "items": call(token, "queries", "items", {"limit": 25}),
+        "items": items,
         "mood": call(token, "queries", "mood", {}),
         "mood_history": call(token, "queries", "mood_history", {"limit": 40}),
         "people": call(token, "queries", "people", {"limit": 200}),
         "prefs": call(token, "queries", "prefs", {"limit": 200}),
     }
+    search_term = pick_search_term(items)
+    print(f"  搜索断言用关键词：{search_term or '（这批数据里挑不出，交互校验会跳过搜索段）'}")
     for name, value in data.items():
         (OUT_DIR / f"{name}.json").write_text(
             json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -352,6 +411,7 @@ def main() -> int:
             STUB.replace("__DATA__", data_json)
             .replace("__THEME__", "dark" if dark else "light")
             .replace("__STYLE__", style)
+            .replace("__SEARCH_TERM__", search_term.replace("\\", "\\\\").replace("'", "\\'"))
         )
         # 宿主 SDK 是给 <html> 加/去 dark class 并把 dashboardStyle 写到根元素
         # （plugin-custom-page.ts:73-75），页面里的 `html.dark .cg-root` 与
