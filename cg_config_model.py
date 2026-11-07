@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover - 仅用于脱离 Runner 的本地导入
 from .cg_person import DEFAULT_INTIMACY_LEVELS, DEFAULT_ROLES
 
 
-CONFIG_VERSION = "1.3.0"
+CONFIG_VERSION = "1.4.0"
 
 #: 本插件负责补全的五类情境记忆。顺序即注入时的展示顺序。
 ALL_CATEGORIES: tuple[str, ...] = (
@@ -950,6 +950,156 @@ class ThoughtConfig(PluginConfigBase):
     )
 
 
+class KeepsakeConfig(PluginConfigBase):
+    """留念：留一样完全没用的东西。
+
+    用户第 58 轮的原话：「留一样完全没用的东西……人身上最有生命气息的部分，
+    或许并不是单纯的喜怒哀乐，而是在这些不产生价值，看似毫无意义的地方。」
+
+    这一节刻意做得很小，因为它能调的只有「收不收」和「最多几件」。**没有**
+    「几条以上自动清理」这种选项：一旦自动淘汰存在，这个功能就退化成收藏夹了。
+    满了之后系统只把状态标出来，放掉哪一条由她自己决定。
+    """
+
+    __ui_label__ = "留念"
+    __ui_icon__ = "keepsake"
+    __ui_order__ = 39
+
+    enabled: bool = Field(
+        default=True,
+        description="是否允许她留一些没用的东西",
+        json_schema_extra=_ui(
+            "允许留住没用的东西",
+            "她偶尔会留下一样完全没用的东西：一句话、一个画面。"
+            "它不进记忆、不参与回复，只在少数时刻被她自己想起来",
+        ),
+    )
+    max_items: int = Field(
+        default=12,
+        ge=1,
+        le=60,
+        description="最多留几件",
+        json_schema_extra=_ui(
+            "最多留几件",
+            "**满了不自动清理**，只会提醒她「可以挑一件放掉」。"
+            "想多留一点就调大",
+        ),
+    )
+    extract_hint: bool = Field(
+        default=True,
+        description="抽取时顺便问一句「有没有什么没用的东西想留着」",
+        json_schema_extra=_ui(
+            "抽取时顺便问",
+            "关掉后只能靠用户在 WebUI 里手动加。开着不影响抽取本身的质量，"
+            "只是多一个字段",
+        ),
+    )
+    mention_in_reply: bool = Field(
+        default=False,
+        description="聊天里是否允许她提到留着的东西",
+        json_schema_extra=_ui(
+            "聊天里可以提起",
+            "默认关。开着的话她可能在普通对话里忽然想起某件留着的东西——"
+            "但那会让它变得「有用」，所以第一版先不开",
+        ),
+    )
+
+
+class ProactiveConfig(PluginConfigBase):
+    """主动：她自己想去看点东西。
+
+    用户第 58 轮的原话：「在没有任何预设目标或指令的情况下，仅仅因为『好奇』
+    或『觉得有趣』，就去主动去做一件完全没有人告诉过她或让她去做的事情。」
+
+    **默认关。** 这是第一版原型，它改的是「她会不会主动开口」——最不该默认开
+    的那一类开关。宿主侧走 ``maisaka.proactive.trigger``，那条路径会 arm 强制
+    触发、绕过频率门控，等于绕过了现有所有「别太吵」的机制。
+
+    还有一条硬限制写在这里，因为它决定了这个功能能做什么：**她不能上网**。
+    宿主没有 ``web.search`` / ``web.fetch``（78 项能力里一个 ``web.*`` 都没有），
+    所以「好奇 → 自己去查」现在只能是编的。这个原型让她回读自己的过去——
+    几百条聊天原文、没聊完的话题、留着没用的东西。这是真好奇。
+    """
+
+    __ui_label__ = "主动"
+    __ui_icon__ = "spark"
+    __ui_order__ = 41
+
+    enabled: bool = Field(
+        default=False,
+        description="是否允许她自己主动开口",
+        json_schema_extra=_ui(
+            "允许主动开口",
+            "**默认关。** 开启后她会自己想起点什么，然后决定要不要说。"
+            "这改的是「她会不会主动找你」，所以第一次上线建议先看几天日志再开",
+        ),
+    )
+    cooldown_hours: float = Field(
+        default=8.0,
+        ge=0.5,
+        le=168.0,
+        description="两次主动之间至少间隔多少小时",
+        json_schema_extra=_ui("最短间隔（小时）", "和下面每天的次数一起做双重限速"),
+    )
+    daily_limit: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="一天最多主动几次",
+        json_schema_extra=_ui("每天最多几次", "第一版建议就是 1 次"),
+    )
+    idle_minutes: float = Field(
+        default=90.0,
+        ge=5.0,
+        le=1440.0,
+        description="安静多久才算「清静下来了」",
+        json_schema_extra=_ui(
+            "安静多久才算空闲（分钟）",
+            "太短会把正常对话中间的停顿当成空闲，然后就插话了",
+        ),
+    )
+    quiet_start_hour: int = Field(
+        default=0,
+        ge=0,
+        le=23,
+        description="免打扰开始时间（小时，0-23）",
+        json_schema_extra=_ui("免打扰开始", "跨零点也支持，比如 23 到 7"),
+    )
+    quiet_end_hour: int = Field(
+        default=8,
+        ge=0,
+        le=23,
+        description="免打扰结束时间（小时，0-23）",
+        json_schema_extra=_ui("免打扰结束", "和开始时间相同表示没有免打扰时段"),
+    )
+    include_keepsake: bool = Field(
+        default=True,
+        description="主动时是否可以把「留着的没用东西」当成由头",
+        json_schema_extra=_ui(
+            "可以因为留念开口",
+            "这是「浪费」唯一的出口。关掉后留念就只能看，永远不会被提起",
+        ),
+    )
+    include_unfinished: bool = Field(
+        default=True,
+        description="主动时是否可以把「没聊完的话题」当成由头",
+        json_schema_extra=_ui(
+            "可以因为没聊完的事开口",
+            "最接近人「忽然想起来」的感觉。它本来就是记忆里的 open_loop，"
+            "不需要新数据",
+        ),
+    )
+    log_skips: bool = Field(
+        default=True,
+        description="没开口时是否也记一行日志",
+        json_schema_extra=_ui(
+            "记录没开口的原因",
+            "主动功能最难排查的不是「她为什么说了」，而是「她为什么又没说话」。"
+            "建议一直开着",
+        ),
+    )
+
+
 class RetentionConfig(PluginConfigBase):
     """保留：各类记忆的过期策略。"""
 
@@ -1800,6 +1950,16 @@ class CompanionGapConfig(PluginConfigBase):
         default_factory=ThoughtConfig,
         description="念头",
         json_schema_extra=_ui("念头"),
+    )
+    keepsake: KeepsakeConfig = Field(
+        default_factory=KeepsakeConfig,
+        description="留念",
+        json_schema_extra=_ui("留念"),
+    )
+    proactive: ProactiveConfig = Field(
+        default_factory=ProactiveConfig,
+        description="主动",
+        json_schema_extra=_ui("主动"),
     )
     debug: DebugConfig = Field(
         default_factory=DebugConfig,

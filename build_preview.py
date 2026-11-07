@@ -386,6 +386,11 @@ def main() -> int:
         "mood_history": call(token, "queries", "mood_history", {"limit": 40}),
         "people": call(token, "queries", "people", {"limit": 200}),
         "prefs": call(token, "queries", "prefs", {"limit": 200}),
+        # 三块新面板的数据源。缺了它们页面会停在「正在读取…」，
+        # 而预览里看起来像页面坏了——和之前 items 少给 status 是同一个坑。
+        "thoughts": call(token, "queries", "thoughts", {"limit": 60}),
+        "keepsakes": call(token, "queries", "keepsakes", {"limit": 200}),
+        "sparks": call(token, "queries", "sparks", {"limit": 60}),
     }
     search_term = pick_search_term(items)
     print(f"  搜索断言用关键词：{search_term or '（这批数据里挑不出，交互校验会跳过搜索段）'}")

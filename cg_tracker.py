@@ -644,6 +644,9 @@ class SessionTracker:
         prefs_enabled = self._prefs_enabled()
         known_prefs = self._known_prefs() if prefs_enabled else ()
 
+        # 留念也搭车：同一份聊天记录，多问一句「有没有什么没用的东西想留着」。
+        keepsake_enabled = self._keepsake_enabled()
+
         result = await run_extraction(
             self._ctx.llm,
             transcript=transcript,
@@ -664,6 +667,7 @@ class SessionTracker:
             known_prefs=known_prefs,
             role_hints=role_hints,
             roles=role_table,
+            keepsake_enabled=keepsake_enabled,
         )
 
         # 空回复在小模型上是高频瞬时问题（宿主自己也会重试），这里补一次重试。
@@ -694,6 +698,7 @@ class SessionTracker:
                 known_prefs=known_prefs,
                 role_hints=role_hints,
                 roles=role_table,
+                keepsake_enabled=keepsake_enabled,
             )
 
         written = 0
@@ -701,6 +706,7 @@ class SessionTracker:
         people_written = 0
         prefs_written = 0
         thoughts_written = 0
+        keepsakes_written = 0
         if result.ok:
             resolved_count = self._apply_resolved(entry.session_id, result.resolved)
             written = self._apply_items(entry.session_id, result.items)
@@ -710,6 +716,7 @@ class SessionTracker:
             if prefs_enabled:
                 prefs_written = self._apply_prefs(result.prefs)
             thoughts_written = self._apply_thoughts(entry.session_id, result.thoughts)
+            keepsakes_written = self._apply_keepsakes(entry.session_id, result.keepsakes)
 
         try:
             self._store.record_extraction(
@@ -730,9 +737,11 @@ class SessionTracker:
         else:
             people_note = f", 人物 {people_written} 条" if people_written else ""
             thought_note = f", 念头 {thoughts_written} 条" if thoughts_written else ""
+            keep_note = f", 留念 {keepsakes_written} 件" if keepsakes_written else ""
             self._info(
                 f"会话 {entry.session_id} 抽取完成: 新增/合并 {written} 条, "
-                f"解决 {resolved_count} 条{people_note}{thought_note}, 模型={result.model or '?'}"
+                f"解决 {resolved_count} 条{people_note}{thought_note}{keep_note}, "
+                f"模型={result.model or '?'}"
             )
         if self._log_extract_raw and result.raw_response:
             self._debug(f"会话 {entry.session_id} 模型原始返回:\n{result.raw_response[:2000]}")
@@ -1041,6 +1050,21 @@ class SessionTracker:
             return False
         return bool(getattr(prefs, "enabled", False))
 
+    def _keepsake_enabled(self) -> bool:
+        """抽取时要不要问一句「有没有什么没用的东西想留着」。
+
+        它和 ``keepsake.enabled`` 不是同一件事：``enabled`` 管的是「能不能留」，
+        这个 ``extract_hint`` 管的是「要不要主动去问她」。关掉提示仍然可以在
+        WebUI 里手动加——但那样就永远不会自己收下任何东西了。
+        """
+
+        keep = getattr(self._config(), "keepsake", None)
+        if keep is None:
+            return False
+        if not bool(getattr(keep, "enabled", True)):
+            return False
+        return bool(getattr(keep, "extract_hint", True))
+
     def _known_prefs(self) -> list[str]:
         """列出已有的口味，让模型只补充、不重复。"""
 
@@ -1201,6 +1225,54 @@ class SessionTracker:
             self._store.trim_thoughts(session_id, keep=40)
         except Exception as exc:  # noqa: BLE001
             self._warn(f"trim_thoughts 失败: {exc!r}")
+        return written
+
+    def _apply_keepsakes(self, session_id: str, keepsakes: list[dict[str, Any]]) -> int:
+        """把抽取出来的留念写进 ``gap_keepsakes``。
+
+        三条和别处不同的规则，都是刻意的：
+
+        1. **不查来源。** 念头必须能指回一句原文，留念不需要——一样没用的东西
+           不该被要求证明自己从哪来。
+        2. **满了就不再收。** 不收也不删旧的：满了之后 ``is_full`` 为真，由
+           ``_keepsake_overflow_note`` 让她自己想「要不要放掉一个」。系统永远
+           不替她决定扔哪一条。
+        3. **不参与衰减、不参与注入。** 这里只写表，没有任何地方会把它读进
+           提示词（除非「主动」把它当成开口的由头）。
+        """
+
+        config = self._config()
+        keep_cfg = getattr(config, "keepsake", None)
+        if keep_cfg is not None and not bool(getattr(keep_cfg, "enabled", True)):
+            return 0
+        if not keepsakes:
+            return 0
+
+        cap = int(getattr(keep_cfg, "max_items", 12) or 12)
+        now = time.time()
+        written = 0
+        for entry in keepsakes:
+            content = str(entry.get("content") or "").strip()
+            if not content:
+                continue
+            dirty = system_text_reason(content)
+            if dirty:
+                self._warn(f"丢弃疑似系统文本的留念（{dirty}）: {content[:120]}")
+                continue
+            try:
+                if self._store.keep_count(session_id) >= max(1, cap):
+                    self._debug(f"留念已满（{cap} 件），这一件先不收：{content[:60]}")
+                    break
+                self._store.add_keepsake(
+                    session_id,
+                    content=content,
+                    kind=str(entry.get("kind") or "line"),
+                    source_text="",
+                    now=now,
+                )
+                written += 1
+            except Exception as exc:  # noqa: BLE001
+                self._warn(f"add_keepsake 失败: {exc!r}")
         return written
 
     def _apply_resolved(self, session_id: str, resolved: list[str]) -> int:

@@ -862,6 +862,8 @@ def main() -> int:
         "initiative",
         "history",
         "thought",
+        "keepsake",
+        "proactive",
         "debug",
     ):
         check(expected in sections, f"schema 含 {expected} 节")
@@ -883,7 +885,7 @@ def main() -> int:
                 plain_labels.append(f"[{section_name}].{field_name}={label!r}")
             if not hint or not _has_cjk(hint):
                 plain_hints.append(f"[{section_name}].{field_name}={hint!r}")
-    check(field_total == 179, f"schema 共 179 个配置项（实际 {field_total}）")
+    check(field_total == 192, f"schema 共 192 个配置项（实际 {field_total}）")
     check(not plain_labels, f"每个配置项的 label 都是中文（问题项 {plain_labels}）")
     check(not plain_hints, f"每个配置项的 hint 都是中文（问题项 {plain_hints}）")
 

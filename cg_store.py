@@ -349,6 +349,62 @@ _DDL = (
     CREATE INDEX IF NOT EXISTS idx_gap_thoughts_session
         ON gap_thoughts (session_id, status, expires_at)
     """,
+    # 留念：她留着的一样**没用**的东西。
+    #
+    # 这张表和 gap_items 的区别不是「重要程度」，而是**保留理由完全不同**：
+    # gap_items 里每一条都在回答「值不值得占地方」（所以有 salience、有半衰期、
+    # 有条数上限、会被相似条目合并），而留念的理由是「她不想扔」。
+    #
+    # 所以这里刻意没有 salience 列、没有 expires_at 列、参与任何衰减循环。
+    # 删不删由她自己决定：满了之后系统只把状态标出来（look_count 记她重看过
+    # 几次），**不自动淘汰**。一旦自动淘汰存在，「留一样没用的东西」就退化成
+    # 「一个有 12 个格子的收藏夹」。
+    #
+    # released_at 是「她自己放掉了」的记录，不是删除：放掉的东西还要能在
+    # WebUI 里看见，否则「扔掉」和「从没存在过」就没区别了。
+    """
+    CREATE TABLE IF NOT EXISTS gap_keepsakes (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id     TEXT NOT NULL,
+        kind           TEXT NOT NULL DEFAULT 'line',
+        content        TEXT NOT NULL DEFAULT '',
+        source_text    TEXT NOT NULL DEFAULT '',
+        status         TEXT NOT NULL DEFAULT 'kept',
+        look_count     INTEGER NOT NULL DEFAULT 0,
+        last_looked_ts REAL NOT NULL DEFAULT 0,
+        released_at    REAL NOT NULL DEFAULT 0,
+        created_at     REAL NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_gap_keepsakes_session
+        ON gap_keepsakes (session_id, status, created_at)
+    """,
+    # 主动（好奇心）的记账。
+    #
+    # 只记「什么时候主动过、因为什么、有没有真的开口」，不记她说了什么——
+    # 说了什么在 mai_messages 里已经有，存第二份迟早会和真话不一致。
+    #
+    # reason 存的是**跳过原因**，包括没开口的那些。主动功能最难排查的从来
+    # 不是「她为什么说了」，而是「她为什么又没说话」，所以没开口的那次也必须
+    # 留一行。这是 life-frequency 那份插件文档里最值钱的一条经验。
+    """
+    CREATE TABLE IF NOT EXISTS gap_sparks (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id  TEXT NOT NULL,
+        kind        TEXT NOT NULL DEFAULT 'revisit',
+        content     TEXT NOT NULL DEFAULT '',
+        source      TEXT NOT NULL DEFAULT '',
+        status      TEXT NOT NULL DEFAULT 'skipped',
+        reason      TEXT NOT NULL DEFAULT '',
+        triggered_at REAL NOT NULL DEFAULT 0,
+        created_at  REAL NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_gap_sparks_session
+        ON gap_sparks (session_id, triggered_at)
+    """,
 )
 
 _ITEM_COLUMNS = (
@@ -395,6 +451,19 @@ def _bigrams_no_punct(text: str) -> set[str]:
 
 def _is_cjk(ch: str) -> bool:
     return "\u4e00" <= ch <= "\u9fff"
+
+
+def _day_start_ts(now: float) -> float:
+    """本地时区里「今天」零点的时间戳。
+
+    刻意用本地时区而不是 UTC：额度是按人的作息算的，用户在北京时间凌晨一点
+    还在聊天，那时 UTC 已经是「昨天」了，按 UTC 分会莫名其妙地重置额度。
+    """
+
+    stamp = time.localtime(now)
+    return time.mktime(
+        (stamp.tm_year, stamp.tm_mon, stamp.tm_mday, 0, 0, 0, 0, 0, -1)
+    )
 
 
 def recall_score(message: str, memory: str) -> float:
@@ -2671,6 +2740,366 @@ class GapStore:
             "active": int(row["active"] or 0),
             "voiced": int(row["voiced"] or 0),
             "total": int(row["total"] or 0),
+        }
+
+    # ── 留念（浪费） ──────────────────────────────────────────────
+    #
+    # 注意这里**没有** decay / expire / trim 三个动作，只有 release。不是漏写：
+    # 留念不退场，只被放掉。谁放掉的也分两种——她自己（status='released'）或
+    # 用户在 WebUI 上手动放掉，两种都记 released_at，都保留在列表里。
+
+    _KEEPSAKE_COLUMNS = (
+        "id, session_id, kind, content, source_text, status, "
+        "look_count, last_looked_ts, released_at, created_at"
+    )
+
+    def _keepsake_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "session_id": str(row["session_id"] or ""),
+            "kind": str(row["kind"] or ""),
+            "content": str(row["content"] or ""),
+            "source_text": str(row["source_text"] or ""),
+            "status": str(row["status"] or ""),
+            "look_count": int(row["look_count"] or 0),
+            "last_looked_ts": float(row["last_looked_ts"] or 0.0),
+            "released_at": float(row["released_at"] or 0.0),
+            "created_at": float(row["created_at"] or 0.0),
+        }
+
+    def add_keepsake(
+        self,
+        session_id: str,
+        *,
+        content: str,
+        kind: str = "line",
+        source_text: str = "",
+        now: float | None = None,
+    ) -> int:
+        """收下一样没用的东西，返回 id。
+
+        同一个会话里内容高度相似（``similarity >= 0.80``）的不重复收——她不会
+        把同一件事留两遍。门槛比念头（0.72）高：念头允许措辞漂移，留着的东西
+        应当是她那句话本身。
+        """
+
+        sid = str(session_id or "").strip()
+        text = " ".join(str(content or "").split())
+        if not sid or not text:
+            return 0
+        current = time.time() if now is None else now
+
+        for row in self.list_keepsakes(sid, limit=60, status=""):
+            if row["status"] != "kept":
+                continue
+            if similarity(text, row["content"]) >= 0.80:
+                return int(row["id"])
+
+        cursor = self.conn.execute(
+            "INSERT INTO gap_keepsakes ("
+            "session_id, kind, content, source_text, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'kept', ?)",
+            (sid, str(kind or "line"), text, str(source_text or ""), current),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def list_keepsakes(
+        self,
+        session_id: str,
+        *,
+        limit: int = 40,
+        status: str = "kept",
+    ) -> list[dict[str, Any]]:
+        """列留念。``status=""`` 表示不筛状态。
+
+        **按 created_at 正序**（越旧的在前），和所有其它列表都相反。理由：越旧的
+        留念越该留着，列表也该先看见旧的——按时间倒序正好会把最像留念的挤到
+        最下面看不见。
+        """
+
+        sid = str(session_id or "").strip()
+        if not sid:
+            return []
+        sql = "SELECT id, session_id, kind, content, source_text, status, look_count, " \
+              "last_looked_ts, released_at, created_at FROM gap_keepsakes WHERE session_id = ?"
+        params: list[Any] = [sid]
+        if status:
+            sql += " AND status = ?"
+            params.append(str(status))
+        sql += " ORDER BY created_at ASC, id ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        return [self._keepsake_row(row) for row in self.conn.execute(sql, params).fetchall()]
+
+    def keep_count(self, session_id: str) -> int:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM gap_keepsakes "
+            "WHERE session_id = ? AND status = 'kept'",
+            (sid,),
+        ).fetchone()
+        return int(row["n"] or 0)
+
+    def look_keepsake(self, keepsake_id: int, *, now: float | None = None) -> int:
+        """记一次「她重看了它」。只加计数，不改状态、不刷新时间排序。"""
+
+        kid = int(keepsake_id or 0)
+        if kid <= 0:
+            return 0
+        current = time.time() if now is None else now
+        self.conn.execute(
+            "UPDATE gap_keepsakes SET look_count = look_count + 1, last_looked_ts = ? "
+            "WHERE id = ?",
+            (current, kid),
+        )
+        self.conn.commit()
+        return kid
+
+    def release_keepsake(self, keepsake_id: int, *, now: float | None = None) -> int:
+        """放掉一条。**记录而不是删除**——放掉的东西还要能在 WebUI 里看见，
+        否则「扔掉」和「从没存在过」就没区别了。"""
+
+        kid = int(keepsake_id or 0)
+        if kid <= 0:
+            return 0
+        current = time.time() if now is None else now
+        cursor = self.conn.execute(
+            "UPDATE gap_keepsakes SET status = 'released', released_at = ? "
+            "WHERE id = ? AND status = 'kept'",
+            (current, kid),
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
+
+    def delete_keepsake(self, keepsake_id: int) -> int:
+        """彻底删掉。只给 WebUI 的「删除」用（用户不想要它，不是她放掉的）。"""
+
+        kid = int(keepsake_id or 0)
+        if kid <= 0:
+            return 0
+        cursor = self.conn.execute("DELETE FROM gap_keepsakes WHERE id = ?", (kid,))
+        self.conn.commit()
+        return int(cursor.rowcount)
+
+    def keepsake_stats(self, session_id: str) -> dict[str, int]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return {"kept": 0, "released": 0, "total": 0}
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "COALESCE(SUM(CASE WHEN status = 'kept' THEN 1 ELSE 0 END), 0) AS kept, "
+            "COALESCE(SUM(CASE WHEN status = 'released' THEN 1 ELSE 0 END), 0) AS released "
+            "FROM gap_keepsakes WHERE session_id = ?",
+            (sid,),
+        ).fetchone()
+        return {
+            "kept": int(row["kept"] or 0),
+            "released": int(row["released"] or 0),
+            "total": int(row["total"] or 0),
+        }
+
+    # ── 主动（好奇心）记账 ────────────────────────────────────────
+
+    def record_spark(
+        self,
+        session_id: str,
+        *,
+        kind: str = "revisit",
+        content: str = "",
+        source: str = "",
+        status: str = "skipped",
+        reason: str = "",
+        now: float | None = None,
+    ) -> int:
+        """记一次「想去看点什么」。
+
+        **没开口的那次也要记**（``status='skipped'`` + ``reason``）。主动功能最
+        难排查的从来不是「她为什么说了」，而是「她为什么又没说话」——只记成功
+        的话，出问题时日志里一片空白，看不出是没触发还是被挡住了。
+        """
+
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0
+        current = time.time() if now is None else now
+        cursor = self.conn.execute(
+            "INSERT INTO gap_sparks ("
+            "session_id, kind, content, source, status, reason, triggered_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                sid,
+                str(kind or "revisit"),
+                " ".join(str(content or "").split())[:200],
+                str(source or ""),
+                str(status or "skipped"),
+                str(reason or ""),
+                current if status == "triggered" else 0.0,
+                current,
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def last_spark_ts(self, session_id: str) -> float:
+        """上次**真的开口**的时间。冷却窗口按这个算，不按「试探过」算。"""
+
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0.0
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(triggered_at), 0) AS last FROM gap_sparks "
+            "WHERE session_id = ? AND status = 'triggered'",
+            (sid,),
+        ).fetchone()
+        return float(row["last"] or 0.0)
+
+    def spark_count_today(self, session_id: str, *, now: float | None = None) -> int:
+        """今天真的开口了几次（本地时区的「今天」）。"""
+
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0
+        current = time.time() if now is None else now
+        start = _day_start_ts(current)
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM gap_sparks "
+            "WHERE session_id = ? AND status = 'triggered' AND triggered_at >= ?",
+            (sid, start),
+        ).fetchone()
+        return int(row["n"] or 0)
+
+    def recent_sparks(self, session_id: str, *, limit: int = 30) -> list[dict[str, Any]]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return []
+        rows = self.conn.execute(
+            "SELECT id, session_id, kind, content, source, status, reason, "
+            "triggered_at, created_at FROM gap_sparks WHERE session_id = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (sid, max(1, int(limit))),
+        ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "session_id": str(row["session_id"] or ""),
+                "kind": str(row["kind"] or ""),
+                "content": str(row["content"] or ""),
+                "source": str(row["source"] or ""),
+                "status": str(row["status"] or ""),
+                "reason": str(row["reason"] or ""),
+                "triggered_at": float(row["triggered_at"] or 0.0),
+                "created_at": float(row["created_at"] or 0.0),
+            }
+            for row in rows
+        ]
+
+    # ── 跨会话视图（只给 WebUI 用） ──────────────────────────────
+    #
+    # 上面那些方法都按 session_id 切。页面要回答的却是「她现在心里惦记着
+    # 什么」「她都留着些什么」——按会话切开看，用户得一个个点过去才拼得全。
+    # 所以这几个只做跨会话汇总，不参与任何注入路径。
+
+    def list_all_thoughts(
+        self,
+        *,
+        limit: int = 100,
+        status: str = "",
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """跨会话列念头。``status=""`` 只看还活着的。"""
+
+        current = time.time() if now is None else now
+        sql = f"SELECT {self._THOUGHT_COLUMNS} FROM gap_thoughts WHERE 1 = 1"
+        params: list[Any] = []
+        if status:
+            sql += " AND status = ?"
+            params.append(str(status))
+        else:
+            sql += " AND status = 'active' AND (expires_at = 0 OR expires_at > ?)"
+            params.append(current)
+        sql += " ORDER BY salience DESC, id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        return [
+            self._thought_row(row) for row in self.conn.execute(sql, params).fetchall()
+        ]
+
+    def list_all_keepsakes(
+        self,
+        *,
+        limit: int = 200,
+        status: str = "kept",
+    ) -> list[dict[str, Any]]:
+        """跨会话列留念。``status=""`` 不筛状态。"""
+
+        sql = (
+            "SELECT id, session_id, kind, content, source_text, status, look_count, "
+            "last_looked_ts, released_at, created_at FROM gap_keepsakes WHERE 1 = 1"
+        )
+        params: list[Any] = []
+        if status:
+            sql += " AND status = ?"
+            params.append(str(status))
+        sql += " ORDER BY created_at ASC, id ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        return [
+            self._keepsake_row(row) for row in self.conn.execute(sql, params).fetchall()
+        ]
+
+    def list_all_sparks(self, *, limit: int = 60) -> list[dict[str, Any]]:
+        """跨会话列主动记账（新的在前）。**跳过的也列**——那才是排查的抓手。"""
+
+        rows = self.conn.execute(
+            "SELECT id, session_id, kind, content, source, status, reason, "
+            "triggered_at, created_at FROM gap_sparks "
+            "ORDER BY created_at DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "session_id": str(row["session_id"] or ""),
+                "kind": str(row["kind"] or ""),
+                "content": str(row["content"] or ""),
+                "source": str(row["source"] or ""),
+                "status": str(row["status"] or ""),
+                "reason": str(row["reason"] or ""),
+                "triggered_at": float(row["triggered_at"] or 0.0),
+                "created_at": float(row["created_at"] or 0.0),
+            }
+            for row in rows
+        ]
+
+    def keepsake_totals(self) -> dict[str, int]:
+        """全局留念计数（页面标题栏用，不按会话）。"""
+
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "COALESCE(SUM(CASE WHEN status = 'kept' THEN 1 ELSE 0 END), 0) AS kept, "
+            "COALESCE(SUM(CASE WHEN status = 'released' THEN 1 ELSE 0 END), 0) AS released "
+            "FROM gap_keepsakes"
+        ).fetchone()
+        return {
+            "kept": int(row["kept"] or 0),
+            "released": int(row["released"] or 0),
+            "total": int(row["total"] or 0),
+        }
+
+    def spark_totals(self) -> dict[str, int]:
+        """全局主动计数：真开口几次、跳过几次。"""
+
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "COALESCE(SUM(CASE WHEN status = 'triggered' THEN 1 ELSE 0 END), 0) AS triggered "
+            "FROM gap_sparks"
+        ).fetchone()
+        total = int(row["total"] or 0)
+        triggered = int(row["triggered"] or 0)
+        return {
+            "triggered": triggered,
+            "skipped": max(0, total - triggered),
+            "total": total,
         }
 
 
