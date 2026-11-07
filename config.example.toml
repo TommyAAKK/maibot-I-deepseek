@@ -12,7 +12,7 @@
 # 是否启用插件。关闭后不采集、不抽取、也不注入。
 enabled = true
 # 配置版本号。改配置结构时递增；必须与 _manifest.json 的 version 一致。
-config_version = "1.4.0"
+config_version = "2.0.0"
 
 # ── 采集：决定观察哪些聊天、多久抽一次 ──────────────────────────
 [capture]
