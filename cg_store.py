@@ -311,6 +311,44 @@ _DDL = (
     CREATE INDEX IF NOT EXISTS idx_gap_history_session
         ON gap_history (session_id, ts)
     """,
+    # gap_thoughts 存的是「她心里的事」，**不是事实**。
+    #
+    # 这一条是结构约束，不是提示词要求：念头永远不写进 gap_items，也不参与
+    # 记忆注入。否则会出现这个循环——猜他不开心 → 想关心 → 把「我想关心他」
+    # 当成证据 → 判定他确实不开心 → 越滚越确定。次数多了她不是更有内心，
+    # 只是更容易臆测。
+    #
+    # 所以这里有一列 source_kind / source_id 指回**已经存在的那个事实**
+    # （gap_items 的某条、某条聊天记录的 message_id、某个人），念头自己
+    # 只承载「她怎么想的」。source 那边该衰减衰减、该过期过期，念头跟着
+    # 失效（见 cg_thought.prune_orphans）。
+    #
+    # kind 目前只写 'dissent'（不肯顺着）。其他几种去处（去看看 / 留下来 /
+    # 搁着 / 说出来）暂时没有出口：上网能力宿主根本没提供，留下来没有任何
+    # 下游，写出来全是死代码。等有了出口再开。
+    """
+    CREATE TABLE IF NOT EXISTS gap_thoughts (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id     TEXT NOT NULL,
+        kind           TEXT NOT NULL DEFAULT 'dissent',
+        content        TEXT NOT NULL DEFAULT '',
+        source_kind    TEXT NOT NULL DEFAULT '',
+        source_id      INTEGER NOT NULL DEFAULT 0,
+        source_text    TEXT NOT NULL DEFAULT '',
+        salience       REAL NOT NULL DEFAULT 0.5,
+        status         TEXT NOT NULL DEFAULT 'active',
+        awaken_count   INTEGER NOT NULL DEFAULT 0,
+        last_awaken_ts REAL NOT NULL DEFAULT 0,
+        voiced_at      REAL NOT NULL DEFAULT 0,
+        expires_at     REAL NOT NULL DEFAULT 0,
+        created_at     REAL NOT NULL DEFAULT 0,
+        updated_at     REAL NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_gap_thoughts_session
+        ON gap_thoughts (session_id, status, expires_at)
+    """,
 )
 
 _ITEM_COLUMNS = (
@@ -2421,5 +2459,218 @@ class GapStore:
             (sid,),
         ).fetchone()
         return {"rows": int(row["rows"] or 0), "looked": int(row["looked"] or 0)}
+
+    # ── 念头 ──
+    #
+    # 四类操作：写入、取活着的、记一次被唤起、标成「说出口了」/「过去了」。
+    # 刻意没有「更新内容」——念头不是可编辑的对象，它是某一刻的状态；
+    # 想改就让它过期、再产生新的。
+
+    _THOUGHT_COLUMNS = (
+        "id, session_id, kind, content, source_kind, source_id, source_text, "
+        "salience, status, awaken_count, last_awaken_ts, voiced_at, "
+        "expires_at, created_at, updated_at"
+    )
+
+    def _thought_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "session_id": str(row["session_id"] or ""),
+            "kind": str(row["kind"] or ""),
+            "content": str(row["content"] or ""),
+            "source_kind": str(row["source_kind"] or ""),
+            "source_id": int(row["source_id"] or 0),
+            "source_text": str(row["source_text"] or ""),
+            "salience": float(row["salience"] or 0.0),
+            "status": str(row["status"] or ""),
+            "awaken_count": int(row["awaken_count"] or 0),
+            "last_awaken_ts": float(row["last_awaken_ts"] or 0.0),
+            "voiced_at": float(row["voiced_at"] or 0.0),
+            "expires_at": float(row["expires_at"] or 0.0),
+            "created_at": float(row["created_at"] or 0.0),
+            "updated_at": float(row["updated_at"] or 0.0),
+        }
+
+    def add_thought(
+        self,
+        session_id: str,
+        *,
+        kind: str = "dissent",
+        content: str,
+        source_kind: str = "",
+        source_id: int = 0,
+        source_text: str = "",
+        salience: float = 0.5,
+        expires_at: float = 0.0,
+        now: float | None = None,
+    ) -> int:
+        """写入一条念头，返回 id。
+
+        同一个会话里内容高度相似（``similarity >= 0.72``）的活念头不重复写，
+        改为把显著度往上提一点——她不会同时惦记同一件事两遍。
+        """
+
+        sid = str(session_id or "").strip()
+        text = " ".join(str(content or "").split())
+        if not sid or not text:
+            return 0
+        current = time.time() if now is None else now
+        score = min(1.0, max(0.0, float(salience)))
+
+        for row in self.list_thoughts(sid, limit=24, now=current):
+            if similarity(text, row["content"]) >= 0.72:
+                self.conn.execute(
+                    "UPDATE gap_thoughts SET salience = ?, updated_at = ? WHERE id = ?",
+                    (min(1.0, max(score, row["salience"])), current, row["id"]),
+                )
+                self.conn.commit()
+                return int(row["id"])
+
+        cursor = self.conn.execute(
+            "INSERT INTO gap_thoughts ("
+            "session_id, kind, content, source_kind, source_id, source_text, "
+            "salience, status, expires_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+            (
+                sid,
+                str(kind or "dissent"),
+                text,
+                str(source_kind or ""),
+                int(source_id or 0),
+                str(source_text or "")[:400],
+                score,
+                float(expires_at or 0.0),
+                current,
+                current,
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def list_thoughts(
+        self,
+        session_id: str,
+        *,
+        limit: int = 6,
+        kind: str = "",
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """取还活着的念头，按显著度降序。
+
+        ``expires_at = 0`` 表示不过期（第一版用不到，留给重要的牵挂）；
+        ``expires_at <= now`` 的当场排除，不等后台 sweep。
+        """
+
+        sid = str(session_id or "").strip()
+        if not sid:
+            return []
+        current = time.time() if now is None else now
+        sql = (
+            f"SELECT {self._THOUGHT_COLUMNS} FROM gap_thoughts "
+            "WHERE session_id = ? AND status = 'active' "
+            "AND (expires_at = 0 OR expires_at > ?)"
+        )
+        params: list[Any] = [sid, current]
+        if kind:
+            sql += " AND kind = ?"
+            params.append(kind)
+        sql += " ORDER BY salience DESC, id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        return [self._thought_row(row) for row in self.conn.execute(sql, params).fetchall()]
+
+    def touch_thought(self, thought_id: int, *, now: float | None = None) -> int:
+        """记一次「被唤起」。**不改 status**——唤起了不等于说出口了。"""
+
+        current = time.time() if now is None else now
+        cursor = self.conn.execute(
+            "UPDATE gap_thoughts SET awaken_count = awaken_count + 1, "
+            "last_awaken_ts = ?, updated_at = ? WHERE id = ?",
+            (current, current, int(thought_id)),
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
+
+    def voice_thought(self, thought_id: int, *, now: float | None = None) -> int:
+        """标成「说出口了」。
+
+        状态叫 ``voiced`` 而不是 ``resolved``：她把它说了，不等于这件事解决了。
+        这件事该不该算解决，归 ``gap_items`` 那边的 open_loop 管。
+        """
+
+        current = time.time() if now is None else now
+        cursor = self.conn.execute(
+            "UPDATE gap_thoughts SET status = 'voiced', voiced_at = ?, "
+            "updated_at = ? WHERE id = ? AND status = 'active'",
+            (current, current, int(thought_id)),
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
+
+    def expire_thoughts(self, *, now: float | None = None) -> int:
+        current = time.time() if now is None else now
+        cursor = self.conn.execute(
+            "UPDATE gap_thoughts SET status = 'expired', updated_at = ? "
+            "WHERE status = 'active' AND expires_at > 0 AND expires_at <= ?",
+            (current, current),
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
+
+    def prune_orphan_thoughts(self, *, now: float | None = None) -> int:
+        """来源已经不在的念头一并作废。
+
+        这是「念头不能升级成事实」的另一半：它只能挂在真实存在的东西上。
+        来源被遗忘（``gap_items.status = 'forgotten'``）或被删掉，念头就没有
+        立足点了，即便它自己还没到 TTL。
+        """
+
+        current = time.time() if now is None else now
+        cursor = self.conn.execute(
+            "UPDATE gap_thoughts SET status = 'expired', updated_at = ? "
+            "WHERE status = 'active' AND source_kind = 'item' AND source_id > 0 "
+            "AND source_id NOT IN ("
+            "SELECT id FROM gap_items WHERE status IN ('active', 'resolved'))",
+            (current,),
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
+
+    def trim_thoughts(self, session_id: str, *, keep: int = 40) -> int:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0
+        total = self.conn.execute(
+            "SELECT COUNT(*) FROM gap_thoughts WHERE session_id = ?", (sid,)
+        ).fetchone()[0]
+        excess = int(total) - max(0, int(keep))
+        if excess <= 0:
+            return 0
+        cursor = self.conn.execute(
+            "DELETE FROM gap_thoughts WHERE id IN ("
+            "SELECT id FROM gap_thoughts WHERE session_id = ? "
+            "AND status != 'active' ORDER BY updated_at ASC LIMIT ?)",
+            (sid, excess),
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
+
+    def thought_stats(self, session_id: str, *, now: float | None = None) -> dict[str, int]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return {"active": 0, "voiced": 0, "total": 0}
+        current = time.time() if now is None else now
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "COALESCE(SUM(CASE WHEN status = 'active' "
+            "AND (expires_at = 0 OR expires_at > ?) THEN 1 ELSE 0 END), 0) AS active, "
+            "COALESCE(SUM(CASE WHEN status = 'voiced' THEN 1 ELSE 0 END), 0) AS voiced "
+            "FROM gap_thoughts WHERE session_id = ?",
+            (current, sid),
+        ).fetchone()
+        return {
+            "active": int(row["active"] or 0),
+            "voiced": int(row["voiced"] or 0),
+            "total": int(row["total"] or 0),
+        }
 
 

@@ -155,6 +155,8 @@ mood_mod = importlib.import_module(f"{_PKG_NAME}.cg_mood")
 person_mod = importlib.import_module(f"{_PKG_NAME}.cg_person")
 log_mod = importlib.import_module(f"{_PKG_NAME}.cg_log")
 tracker_mod = importlib.import_module(f"{_PKG_NAME}.cg_tracker")
+thought_mod = importlib.import_module(f"{_PKG_NAME}.cg_thought")
+dissent_mod = importlib.import_module(f"{_PKG_NAME}.cg_dissent")
 AvoidanceProfile = avoidance_mod.AvoidanceProfile
 CompanionGapConfig = config_mod.CompanionGapConfig
 
@@ -1749,6 +1751,11 @@ async def test_plugin(tmp: str) -> None:
             update={"initiative": plugin._config.initiative.model_copy(update=patch)}
         )
 
+    def _set_thought(**patch: Any) -> None:
+        plugin._config = plugin._config.model_copy(  # type: ignore[assignment]
+            update={"thought": plugin._config.thought.model_copy(update=patch)}
+        )
+
     _set_inject(max_items_per_category=1)
 
     seen_rounds: list[str] = []
@@ -2276,6 +2283,192 @@ async def test_plugin(tmp: str) -> None:
     store.conn.commit()
     _set_initiative(enabled=False)
     plugin._mood.reset()  # type: ignore[union-attr]
+
+    # ── 念头端到端：记下来 → planner 知道 → replyer 收到指令 → 太软就重说 ──
+    #
+    # 这条链路跨三次 hook 调用，中间隔着两次模型生成，任何一环松掉都会
+    # 「看起来配好了、实际什么都没发生」——这个插件已经有过五个这种 bug。
+    _set_thought(enabled=True, frequency_hours=0, daily_limit=0, dissent_enabled=True,
+                 instant_signals=True, echo_enabled=True, retry_enabled=True, retry_max=1)
+    _thought_sid = "qq:private:thoughtcheck"
+    store.upsert_state(_thought_sid, chat_type="private", platform="qq",
+                       user_id="20004", user_nickname="阿岚", pending_count=0)
+    _thought_source = "我上周把《沙丘》两部连着看完了"
+    _thought_id = store.add_thought(
+        _thought_sid,
+        content="他说一周看完两部《沙丘》，我有点不信这个速度",
+        source_kind="history",
+        source_text=_thought_source,
+        salience=0.8,
+    )
+    check(_thought_id > 0, "念头落库")
+    check(len(store.list_thoughts(_thought_sid)) == 1, "活念头能读回来")
+
+    # ① planner 侧：当前话题撞上念头的来源 → 注入「你心里还有件事没放下」
+    plugin._dissent_until.clear()  # type: ignore[union-attr]
+    _thought_plan = await plugin.inject_planner_state(
+        session_id=_thought_sid,
+        items=[{"item_type": "SystemMessageItem",
+                "meta": {"item_id": "t1", "logical_turn_id": None,
+                         "timestamp": "2026-01-01T00:00:00+08:00"},
+                "parts": [{"type": "text", "text": "原有系统提示"}]},
+               {"item_type": "UserMessageItem",
+                "meta": {"item_id": "t2", "logical_turn_id": None,
+                         "timestamp": "2026-01-01T00:00:01+08:00"},
+                "parts": [{"type": "text", "text": _thought_source}]}],
+        item_schema_version=1,
+        tool_definitions=json.loads(json.dumps(_gate_tools)),
+        reply_reason=_thought_source,
+    )
+    _thought_items = (_thought_plan.get("modified_kwargs") or {}).get("items") or []
+    _thought_text = json.dumps(_thought_items, ensure_ascii=False)
+    check("你心里还有件事没放下" in _thought_text, "planner 侧注入了念头")
+    check(
+        all(item.get("item_type") in {"SystemMessageItem", "UserMessageItem"}
+            for item in _thought_items),
+        "所有 item 的 item_type 都是宿主认识的类名（写错会整批被丢弃）",
+    )
+    check(
+        all(
+            item.get("item_type") == "SystemMessageItem"
+            for item in _thought_items
+            if "你心里还有件事没放下"
+            in json.dumps(item.get("parts") or [], ensure_ascii=False)
+        ),
+        "念头那句话落在系统消息里，不是混进用户发言（混进去就成了「对方说的」）",
+    )
+    check(
+        bool(plugin._dissent_until.get(_thought_sid)),  # type: ignore[union-attr]
+        "判了「不顺着」之后给 replyer 留了标记",
+    )
+    # 放行「不顺着」之后这条念头被标成 voiced，所以不能再用 list_thoughts
+    # （它只返回 active）来读唤起次数，直接查库。
+    _thought_row = dict(
+        store.conn.execute("SELECT * FROM gap_thoughts WHERE id = ?", (_thought_id,)).fetchone()
+    )
+    check(int(_thought_row["awaken_count"]) >= 1, "念头被记了一次唤起")
+    check(
+        _thought_row["status"] == "voiced",
+        "说出口的念头标成 voiced（三种结局里这一种有记录）",
+    )
+
+    # ② replyer 侧：同一轮必须收到「不必讨好」那段
+    _thought_reply = await plugin.inject_context(
+        session_id=_thought_sid, extra_prompt="", attempt=1, reply_reason=_thought_source,
+    )
+    _thought_prompt = str((_thought_reply.get("modified_kwargs") or {}).get("extra_prompt") or "")
+    check("<companion-dissent>" in _thought_prompt, "replyer 侧注入了「不必讨好」块")
+    check("不必让人舒服" in _thought_prompt, "注入的是真的指令，不是空块")
+    check(
+        "同一件事问到" not in _thought_prompt,
+        "理由不进提示词（说得出理由就等于在解释，而解释是为了让人舒服）",
+    )
+
+    # ③ 说出一句软话 → 要求重生成
+    _soft = await plugin.observe_reply(
+        response="没看过啊，不过你要是想看我可以陪你一起看！",
+        session_id=_thought_sid,
+    )
+    _soft_kwargs = _soft.get("modified_kwargs") or {}
+    check(_soft_kwargs.get("retry") is True, "太软的那句会被要求重生成")
+    check(
+        "太软" in str(_soft_kwargs.get("retry_reason") or ""),
+        "重生成约束里写明了原因",
+    )
+
+    # ④ 重说之后够冷了 → 放行，并且这一轮结束
+    _cold = await plugin.observe_reply(response="没看过就没看过吧", session_id=_thought_sid)
+    check(_cold.get("modified_kwargs") is None, "够冷的那句直接放行")
+    check(
+        not plugin._dissent_until.get(_thought_sid),  # type: ignore[union-attr]
+        "一轮结束后标记被清掉（否则下一轮会白冷一次）",
+    )
+
+    # ⑤ 重试上限：默认只重说 1 次，第二次还是软的就此打住
+    plugin._dissent_record(plugin._config.thought, _thought_sid, time.time())  # type: ignore[union-attr]
+    # 真实顺序是 planner 记录 → replyer 注入（inject_context 里 _dissent_active
+    # 才把「这一轮」打开）→ after_response 判定。这里补上中间那一步，否则
+    # after_response 会以为这一轮根本没判过「不顺着」。
+    check(plugin._dissent_active(_thought_sid), "记录之后 replyer 侧能看到这一轮标记")  # type: ignore[union-attr]
+    _retry1 = await plugin.observe_reply(response="嗯嗯好的呀", session_id=_thought_sid)
+    check((_retry1.get("modified_kwargs") or {}).get("retry") is True, "第一次太软要求重生成")
+    _retry2 = await plugin.observe_reply(response="嗯嗯好的呀", session_id=_thought_sid)
+    check(
+        _retry2.get("modified_kwargs") is None,
+        "到上限就用这一句（重试三次以上会明显拖慢回复，还越改越像在找词）",
+    )
+    plugin._dissent_end_round(_thought_sid)  # type: ignore[union-attr]
+
+    # ⑤b 轮次闸门必须是**按会话**的。宿主能同时跑多个会话，全局一个布尔
+    # 会让 A 组打开的轮次把 B 组正常的回复也拉回去重生成。
+    _other_sid = "qq:private:thoughtother"
+    store.upsert_state(_other_sid, chat_type="private", platform="qq",
+                       user_id="20005", user_nickname="阿岚", pending_count=0)
+    plugin._dissent_record(plugin._config.thought, _thought_sid, time.time())  # type: ignore[union-attr]
+    check(plugin._dissent_active(_thought_sid), "A 组进入不顺着流程")  # type: ignore[union-attr]
+    _other = await plugin.observe_reply(response="嗯嗯好的呀", session_id=_other_sid)
+    check(
+        _other.get("modified_kwargs") is None,
+        "B 组的回复不会被 A 组打开的轮次牵连（轮次闸门按会话记）",
+    )
+    _other_same = await plugin.observe_reply(response="嗯嗯好的呀", session_id=_thought_sid)
+    check(
+        (_other_same.get("modified_kwargs") or {}).get("retry") is True,
+        "同一个会话里仍然要求重生成（隔离没有把功能本身关掉）",
+    )
+    plugin._dissent_end_round(_thought_sid)  # type: ignore[union-attr]
+    store.conn.execute("DELETE FROM gap_state WHERE session_id = ?", (_other_sid,))
+    store.conn.commit()
+
+    # ⑥ 限速：太频繁就不该再冷
+    _set_thought(enabled=True, frequency_hours=6.0, daily_limit=2)
+    plugin._dissent_last_ts = time.time()  # type: ignore[union-attr]
+    _blocked, _why = plugin._dissent_rate_limited(plugin._config.thought, time.time())  # type: ignore[union-attr]
+    check(_blocked, "刚冷过一次，6 小时内不再冷")
+    check("小时" in _why or "分钟" in _why, "限速原因说得出来（排查靠它）")
+    plugin._dissent_last_ts = 0.0  # type: ignore[union-attr]
+    plugin._dissent_day_count = 0  # type: ignore[union-attr]
+
+    # ⑦ 开关全关 → 一个字都不注入
+    _set_thought(enabled=False)
+    _thought_off = await plugin.inject_planner_state(
+        session_id=_thought_sid,
+        items=[{"item_type": "UserMessageItem",
+                "meta": {"item_id": "t3", "logical_turn_id": None,
+                         "timestamp": "2026-01-01T00:00:02+08:00"},
+                "parts": [{"type": "text", "text": _thought_source}]}],
+        item_schema_version=1,
+        tool_definitions=json.loads(json.dumps(_gate_tools)),
+        reply_reason=_thought_source,
+    )
+    _thought_off_text = json.dumps(
+        (_thought_off.get("modified_kwargs") or {}).get("items") or [], ensure_ascii=False
+    )
+    check("你心里还有件事没放下" not in _thought_off_text, "念头关掉后不注入")
+    _set_thought(enabled=True, frequency_hours=0, daily_limit=0)
+
+    # ⑧ 抽取结果里缺 source 的念头必须被丢掉（这是「念头变事实」的唯一闸门）
+    _written = plugin._tracker._apply_thoughts(  # type: ignore[union-attr]
+        _thought_sid,
+        [
+            {"content": "我有点不信他真看过", "source": "他说他没看过", "salience": 0.6},
+            {"content": "他最近应该很累", "source": "", "salience": 0.9},
+            {"content": "", "source": "他说他没看过", "salience": 0.9},
+        ],
+    )
+    check(_written == 1, "缺 content 或 source 的念头在落库那一层被丢掉")
+    check(
+        all("很累" not in str(row["content"]) for row in store.list_thoughts(_thought_sid, limit=20)),
+        "猜测别人状态的念头没进库",
+    )
+
+    # 收尾
+    store.conn.execute("DELETE FROM gap_thoughts WHERE session_id = ?", (_thought_sid,))
+    store.conn.execute("DELETE FROM gap_state WHERE session_id = ?", (_thought_sid,))
+    store.conn.commit()
+    plugin._dissent_until.clear()  # type: ignore[union-attr]
+    _set_thought(enabled=True, frequency_hours=6.0, daily_limit=2,
+                 retry_enabled=True, retry_max=1)
 
     store.delete_session_items(abs_sid)
     store.delete_session_items(abs_group)
@@ -3062,6 +3255,7 @@ def test_config() -> None:
         "backfill",
         "initiative",
         "history",
+        "thought",
         "debug",
     )
 
@@ -3088,7 +3282,7 @@ def test_config() -> None:
                 missing_label.append(f"[{section}].{name}")
             if not hint or not has_cjk(hint):
                 missing_hint.append(f"[{section}].{name}")
-    check(total == 170, f"{len(sections)} 个节共 170 个配置项（实际 {total}）")
+    check(total == 179, f"{len(sections)} 个节共 179 个配置项（实际 {total}）")
     check(not missing_label, f"每个配置项都有中文 label（缺 {missing_label}）")
     check(not missing_hint, f"每个配置项都有中文 hint（缺 {missing_hint}）")
 
@@ -5802,6 +5996,287 @@ def test_guard() -> None:
     )
 
 
+def test_thought() -> None:
+    """[18] 念头：她的想法，不是事实。
+
+    这一节守的是一条结构约束：念头永远不能变成事实。三条执行点——
+    ① 不写进 ``gap_items``（用不着测，是表设计）；
+    ② 抽取时缺 ``source`` 的条目直接丢；
+    ③ 渲染时明说「这是你自己的想法」。
+    ②③ 在本节，① 在 ``test_store``。
+    """
+
+    print("[18] 念头")
+
+    Thought = thought_mod.Thought
+
+    # ── 生命周期时长：显著度越高活越久，但不是无限久 ──
+    check(
+        thought_mod.ttl_seconds(0.0) == thought_mod.TTL_MIN_SECONDS,
+        "显著度 0 的念头至少活 40 分钟",
+    )
+    check(
+        thought_mod.ttl_seconds(1.0) == thought_mod.TTL_MAX_SECONDS,
+        "显著度 1 的念头最多活 36 小时",
+    )
+    check(
+        thought_mod.ttl_seconds(0.5) < thought_mod.ttl_seconds(0.9),
+        "显著度高活得更久",
+    )
+    # 反向断言：念头不该有「长期记忆」那种寿命。真正重要的牵挂已经在
+    # open_loop 里活 30 天，念头再存一套就是两套记忆互相打架。
+    check(
+        thought_mod.TTL_MAX_SECONDS <= 72 * 3600.0,
+        "念头最多活 3 天，长期牵挂交给 open_loop 而不是念头",
+    )
+
+    def _row(**over: Any) -> dict[str, Any]:
+        base = {
+            "id": 1,
+            "session_id": "qq:private:a",
+            "kind": "dissent",
+            "content": "他说没看过那部片子，我有点不信",
+            "source_kind": "item",
+            "source_id": 7,
+            "source_text": "我上周刚看完那部",
+            "salience": 0.6,
+            "status": "active",
+            "awaken_count": 0,
+            "last_awaken_ts": 0.0,
+            "voiced_at": 0.0,
+            "expires_at": time.time() + 3600,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+        base.update(over)
+        return base
+
+    thought = Thought.from_row(_row())
+    check(thought.id == 1, "Thought.from_row 认得 id")
+    check(thought.salience == 0.6, "Thought.from_row 认得显著度")
+
+    # ── 唤起：命中来源或命中内容都算 ──
+    score_src, on_src = thought_mod.score_echo(thought, "我上周刚看完那部")
+    check(on_src == "source", f"原话重现时命中 source（{on_src}）")
+    check(score_src > thought_mod.ECHO_SIMILARITY, f"原话重现时分数够（{score_src:.2f}）")
+
+    score_miss, _ = thought_mod.score_echo(thought, "今天天气不错")
+    check(
+        score_miss < thought_mod.ECHO_SIMILARITY,
+        f"聊别的事时勾不起念头（{score_miss:.2f}）",
+    )
+
+    echo = thought_mod.pick_echo([thought], "我上周刚看完那部")
+    check(echo is not None and echo.thought.id == 1, "pick_echo 能挑出被勾起的念头")
+    check(
+        thought_mod.pick_echo([thought], "今天天气不错") is None,
+        "勾不起时返回 None",
+    )
+    # 反向断言：门槛比记忆低（该对上的是原话，不是话题概括），
+    # 但要高到「随便说句话撞不上」。
+    check(
+        thought_mod.ECHO_SIMILARITY < 0.40,
+        "念头唤起门槛低于记忆注入门槛（比的是原话，不是话题）",
+    )
+    check(thought_mod.ECHO_SIMILARITY >= 0.20, "唤起门槛不能低到随便一句话就撞上")
+
+    # ── 说出口的条件：被唤起码两次 ──
+    check(not thought_mod.should_voice(thought), "刚产生的念头不该马上说出口")
+    check(
+        thought_mod.should_voice(thought, min_awaken=1),
+        "调低门槛后第一次就能说（配置成 1 时的行为）",
+    )
+    check(
+        thought_mod.should_voice(Thought.from_row(_row(awaken_count=5))),
+        "被反复勾起的念头早晚会说出口",
+    )
+
+    # ── 渲染：必须明说「这是你自己的想法」──
+    note = thought_mod.render_planner_note(thought)
+    check(thought.content in note, "规划器提示里带念头内容")
+    check("不是已经发生的事实" in note, "规划器提示明说念头不是事实")
+    check("你自己判断" in note, "要不要提交给她自己决定")
+
+    block = thought_mod.render_dissent_block()
+    check("companion-dissent" in block, "不顺着指令带自己块标记")
+    check("不必让人舒服" in block, "指令里说明这一句不必让人舒服")
+    check("附和" in block, "指令里禁止附和")
+    check("解释" in block, "指令里禁止解释自己")
+    check("颜文字" in block, "指令里禁止颜文字（人设写着喜欢用，模型一定会加）")
+    check(
+        "委屈" in block,
+        "指令里说清「不要演委屈」——这是选择，不是被冒犯",
+    )
+
+    # **理由只进日志不进提示词**：理由一旦写进提示词，模型会把它说出来，
+    # 而用户要的恰恰是「说不出理由地不想接」。
+    with_reason = thought_mod.render_dissent_block(reason="同一件事问到第三遍")
+    check(
+        with_reason == block,
+        "念头的理由不进提示词（否则她会把理由说出来）",
+    )
+
+    # ── 三态兑现：说出口只是其中一种 ──
+    stats = thought_mod.ThoughtStats(active=3, voiced=1, total=4, echoes=2)
+    check(stats.active == 3, "ThoughtStats 记着还活着的念头")
+    check(
+        not hasattr(stats, "failed"),
+        "ThoughtStats 没有「失败」这个字段——自然消散不惩罚",
+    )
+
+    check("勾" in thought_mod.describe_echo(echo), "describe_echo 能给出被勾起的说明")
+    check("没有" in thought_mod.describe_echo(None), "没被勾起时如实说没有")
+
+    # ── 抽取侧：缺 source 的念头必须丢 ──
+    parser = getattr(extract_mod, "_parse_thoughts", None)
+    check(parser is not None, "抽取结果里有念头解析函数")
+    if parser is not None:
+        good = parser([{"content": "我有点不信他真看过", "source": "我上周刚看完那部"}])
+        check(len(good) == 1, "带来源的念头保留")
+        check(good[0]["content"] == "我有点不信他真看过", "念头内容保留")
+        check(
+            parser([{"content": "我有点不信他真看过"}]) == [],
+            "**没有来源的念头直接丢掉**（这是「念头不能升级成事实」的执行点）",
+        )
+        check(
+            parser([{"content": "他觉得那部片子不好看", "source": "x"}]) != [],
+            "解析层不判断是不是事实判断（那条靠提示词，解析层只管来源）",
+        )
+        many = parser(
+            [
+                {"content": f"想法{i}", "source": "某句话", "salience": 0.5}
+                for i in range(5)
+            ]
+        )
+        check(len(many) <= 2, f"一次最多记 2 条念头（实际 {len(many)}）")
+        check(parser("not a list") == [], "非数组输入返回空")
+
+
+def test_dissent() -> None:
+    """[19] 不顺着：当场信号 + 冷场判定。
+
+    用户的原话：「说一句让场面冷下来的话——而且说完不补救。」
+    这一节守两件事：①当场信号只认「她做得到但不想」的理由，不认「她本来就
+    做不到」的（精力低、深夜）；②冷场判定宁可漏判也不要误判——把一句本来
+    就冷的话拉回去重说，只会说得更热。
+    """
+
+    print("[19] 不顺着")
+
+    # ── 敷衍判定：短**且**基本只是语气词 ──
+    for sample in ("嗯", "哦", "好", "嗯嗯", "哦哦", "哈哈", "呃"):
+        check(dissent_mod.is_short_reply(sample), f"算敷衍：{sample}")
+    # 关键反例：「不知道」也是三个字，但那是在回答，不是敷衍。
+    # 「行吧」「可能吧」同理——是勉强答应 / 不确定，不是没在听。
+    for sample in ("不知道", "我在想", "可能吧", "行吧", "这个我不清楚"):
+        check(not dissent_mod.is_short_reply(sample), f"不算敷衍：{sample}")
+
+    check(
+        dissent_mod.count_short_streak(["嗯", "哦", "好", "今天聊点别的吧"]) == 0,
+        "连着敷衍后才被最后一句正常话打断",
+    )
+    check(
+        dissent_mod.count_short_streak(["嗯", "哦", "好"]) == 3,
+        "数得出连了几条敷衍",
+    )
+
+    # ── 问句判定 ──
+    # 只认标点和句尾语气词，不认疑问词——「为什么我也不知道」不是问句，
+    # 而中文聊天里问句几乎总带问号或「吗/呢」。
+    for sample in ("你看过吗", "这个呢？", "怎么样?", "为什么？"):
+        check(dissent_mod.is_question(sample), f"算问句：{sample}")
+    check(not dissent_mod.is_question("我看过了"), "陈述句不算问句")
+    check(
+        not dissent_mod.is_question("为什么我也不知道"),
+        "带疑问词但不是问句的不算（避免把陈述句当提问）",
+    )
+
+    check(dissent_mod.has_addressing("你在吗"), "叫到她了")
+    check(not dissent_mod.has_addressing("今天下雨了"), "没叫她")
+
+    # ── 当场信号：三个都是「做得到但不想」──
+    repeated = ["你玩过黑神话吗", "你玩过黑神话吗", "你玩过黑神话吗"]
+    sig = dissent_mod.analyse_signals(repeated, current="你玩过黑神话吗")
+    check(sig.repeat_count >= dissent_mod.REPEAT_ASK_TIMES, f"数得出重复提问（{sig.repeat_count}）")
+    check(sig.fired, "重复提问算信号")
+    check("第" in sig.reason, f"重复信号有可读原因：{sig.reason}")
+
+    sig2 = dissent_mod.analyse_signals(["嗯", "哦", "好"], current="好")
+    check(sig2.short_streak >= dissent_mod.SHORT_REPLY_STREAK, "数得出连续敷衍")
+    check(sig2.fired, "连续敷衍算信号")
+    check("敷衍" in sig2.reason, f"敷衍信号有可读原因：{sig2.reason}")
+
+    # 但在对方说了句正经话之后，连续计数必须断——那不是敷衍，是刚开口。
+    broken = dissent_mod.analyse_signals(["嗯", "哦", "好"], current="今天聊点别的吧")
+    check(broken.short_streak == 0, "最后一句是正经话时连击断开")
+
+    normal = dissent_mod.analyse_signals(
+        ["今天去看电影了", "挺好的", "你最近在忙什么"],
+        current="在打游戏",
+    )
+    check(not normal.fired, "正常聊天不触发任何信号")
+    check(normal.reason == "", "没触发时不给原因")
+
+    # **反向断言：当场信号里不能有「精力低」「深夜」这类理由。**
+    # 那些是「她本来就做不到」，不是「她做得到但不想」——混进来就把
+    # 用户要的东西变成了另一个精力门控。
+    import inspect as _inspect  # noqa: E402
+
+    sig_src = _inspect.getsource(dissent_mod.analyse_signals)
+    check("energy" not in sig_src, "当场信号不看精力（那是做不到，不是不想）")
+    check("hour" not in sig_src.lower(), "当场信号不看时段（深夜不是理由）")
+
+    # ── 冷场判定：该放行的 ──
+    cold_cases = (
+        "没看过就没看过吧",
+        "嗯。",
+        "没看过。",
+        "那你想看吗？",
+        "没看过。(｡･ω･｡)",
+        "我不知道",
+        "哦",
+        "看吧，随便",
+        "没看过，你想看就自己去看",
+    )
+    for sample in cold_cases:
+        verdict = dissent_mod.judge_coldness(sample)
+        check(verdict.cold, f"够冷：{sample}（{verdict.reason}）")
+
+    # ── 冷场判定：该重生成的 ──
+    hot_cases = (
+        ("哈哈原来是这样呀，我还以为你看过呢", "缓和词 + 追问"),
+        ("没看过啊，不过你要是想看我可以陪你一起看！", "提供帮助"),
+        ("嗯嗯好的呀", "缓和词"),
+    )
+    for sample, why in hot_cases:
+        verdict = dissent_mod.judge_coldness(sample)
+        check(not verdict.cold, f"还太软（{why}）：{sample}")
+        check(verdict.reason != "", f"说明为什么软（{verdict.reason}）")
+
+    # **反向断言：「吧」不能当成追问。** 「没看过就没看过吧」结尾也是「吧」，
+    # 那是冷淡的收尾；误判会让她把一句本来就冷的话重说一遍，越说越热。
+    check(
+        dissent_mod.judge_coldness("没看过就没看过吧").cold,
+        "结尾的「吧」不算追问（那是冷淡的收尾，不是反问）",
+    )
+    # 颜文字单独一项不算致命：去掉就够冷了，不值得冒险重说一遍。
+    check(
+        dissent_mod.judge_coldness("没看过。(｡･ω･｡)").cold,
+        "只带一个颜文字仍算冷（轻项单独不致命）",
+    )
+    # 太长单独一项就致命：40 字以上几乎一定在解释。
+    long_text = "没看过啊，不过我觉得这部片子评价挺高的你要是有兴趣可以看看我也可以陪你去" * 2
+    check(
+        not dissent_mod.judge_coldness(long_text).cold,
+        "太长就判软（超过字数上限几乎一定在解释）",
+    )
+
+    check(
+        dissent_mod.describe_coldness(dissent_mod.judge_coldness("嗯。")) != "",
+        "describe_coldness 能给出可读结论",
+    )
+
+
 # ── 主流程 ──
 
 async def main() -> None:
@@ -5830,6 +6305,8 @@ async def main() -> None:
         await test_backfill()
         test_history()
         test_guard()
+        test_thought()
+        test_dissent()
         await test_energy_gate(tmp)
     finally:
         for store in list(_OPEN_STORES):

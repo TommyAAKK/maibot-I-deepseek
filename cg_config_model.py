@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover - 仅用于脱离 Runner 的本地导入
 from .cg_person import DEFAULT_INTIMACY_LEVELS, DEFAULT_ROLES
 
 
-CONFIG_VERSION = "1.2.1"
+CONFIG_VERSION = "1.3.0"
 
 #: 本插件负责补全的五类情境记忆。顺序即注入时的展示顺序。
 ALL_CATEGORIES: tuple[str, ...] = (
@@ -842,6 +842,111 @@ class HistoryConfig(PluginConfigBase):
         le=500,
         description="每个会话最多保留几段洞",
         json_schema_extra=_ui("最多保留几段洞", "太久以前的洞没有提的价值"),
+    )
+
+
+class ThoughtConfig(PluginConfigBase):
+    """念头：她心里有点自己的想法，偶尔不顺着。
+
+    用户第 47 轮的原话：「不是单纯的、代码和规则上的拒绝，而是在一个她完全
+    可以继续有用、继续正确、继续被喜欢的时刻，说一句让场面冷下来的话——而且
+    说完不补救。」
+
+    这一节有三处刻意的设计，都在别处解释过，这里只留一行提示：
+
+    - **念头不是事实**。它只存在 ``gap_thoughts`` 里，不进记忆库、不参与记忆
+      注入，且每条必须带一句真实的聊天原文作来源。否则会形成「猜他不开心 →
+      想关心 → 把关心当证据 → 判定他确实不开心」的自我强化循环。
+    - **默认开，但频率很保守**。6 小时最多 1 次、每天最多 2 次。这两个数字是
+      拍的，第一次上线宁可太少见——太少见只是没注意到，太常见就变成人设崩了。
+    - **当场信号**是另一条来源：同一件事今天问到第三遍、对方连着敷衍、
+      近几轮全是问句。这些不需要建表，一条规则就能算出来。
+    """
+
+    __ui_label__ = "念头"
+    __ui_icon__ = "thought"
+    __ui_order__ = 38
+
+    enabled: bool = Field(
+        default=True,
+        description="是否启用念头",
+        json_schema_extra=_ui(
+            "启用念头",
+            "开启后抽取时会记下「她自己的想法」，并在少数时刻允许她不顺着对方。"
+            "关掉则完全回到原来的相处方式",
+        ),
+    )
+    frequency_hours: float = Field(
+        default=6.0,
+        ge=0.5,
+        le=168.0,
+        description="两次「不顺着」之间至少间隔多少小时",
+        json_schema_extra=_ui(
+            "最短间隔（小时）",
+            "第一次上线宁可选大一点。太少见只是没注意到，太常见就变成人设崩了",
+        ),
+    )
+    daily_limit: int = Field(
+        default=2,
+        ge=1,
+        le=20,
+        description="一天最多「不顺着」几次",
+        json_schema_extra=_ui("每天最多几次", "和上面的间隔一起做双重限速"),
+    )
+    echo_enabled: bool = Field(
+        default=True,
+        description="当前话题碰到念头的来源时，是否重新想起它",
+        json_schema_extra=_ui(
+            "允许被勾起",
+            "「自然回响」是念头最主要的去处——被同一句话勾起，不一定要说出口。"
+            "关掉则念头只会随时间消散",
+        ),
+    )
+    dissent_enabled: bool = Field(
+        default=True,
+        description="是否允许她说一句不顺着对方的话",
+        json_schema_extra=_ui(
+            "允许不顺着",
+            "关掉后念头只会影响语气和联想，不会真的说出冷场的话",
+        ),
+    )
+    instant_signals: bool = Field(
+        default=True,
+        description="是否使用当场信号（问烦了 / 被敷衍 / 被当问答机）",
+        json_schema_extra=_ui(
+            "当场信号",
+            "不需要念头也能触发：同一件事问到第三遍、对方连着敷衍、近几轮全是问句。"
+            "这类「说不出理由地不想接」常常根本没有长期来源",
+        ),
+    )
+    retry_enabled: bool = Field(
+        default=True,
+        description="生成完发现没冷下来时，是否要求重生成一次",
+        json_schema_extra=_ui(
+            "冷场兜底",
+            "人设里写着「喜欢用颜文字」「语气轻快」，模型经常一句话就柔回去了。"
+            "开着会检查最终文本，太软就带约束重生成一次",
+        ),
+    )
+    retry_max: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        description="最多重生成几次",
+        json_schema_extra=_ui(
+            "最多重生成几次",
+            "每次重生成都是一遍完整生成。宿主侧上限是 3，这里默认只给 1 次",
+        ),
+    )
+    dissent_max_chars: int = Field(
+        default=40,
+        ge=10,
+        le=200,
+        description="「冷下来」的回复字数上限",
+        json_schema_extra=_ui(
+            "冷场字数上限",
+            "超过这个长度几乎肯定在解释或找补。40 字大概是一句话",
+        ),
     )
 
 
@@ -1690,6 +1795,11 @@ class CompanionGapConfig(PluginConfigBase):
         default_factory=HistoryConfig,
         description="未读历史",
         json_schema_extra=_ui("未读历史"),
+    )
+    thought: ThoughtConfig = Field(
+        default_factory=ThoughtConfig,
+        description="念头",
+        json_schema_extra=_ui("念头"),
     )
     debug: DebugConfig = Field(
         default_factory=DebugConfig,

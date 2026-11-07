@@ -58,6 +58,12 @@ except Exception:  # pragma: no cover
 from .cg_absence import absence_level, absence_seconds, describe_gap, render_absence_note
 from .cg_avoidance import AvoidanceProbe
 from . import cg_log
+from .cg_dissent import (
+    DISSENT_MAX_CHARS,
+    analyse_signals,
+    describe_coldness,
+    judge_coldness,
+)
 from .cg_backfill import (
     BackfillResult,
     default_since,
@@ -135,6 +141,14 @@ from .cg_presence import (
     render_away_note,
 )
 from .cg_store import GapStore, recall_score
+from .cg_thought import (
+    describe_echo,
+    pick_echo,
+    render_dissent_block,
+    render_planner_note,
+    to_thoughts,
+    ttl_seconds,
+)
 from .cg_tracker import SessionTracker
 from .cg_webui import MemoryAdminMixin
 
@@ -154,6 +168,13 @@ INJECT_TIMEOUT_MS = 4000
 
 #: 单次闸门判定的耗时告警线。超过就记一条 warning —— 别等熔断了才发现慢。
 _GATE_SLOW_MS = 800.0
+
+#: 「这一轮她不打算顺着」这个标记的有效期（秒）。
+#:
+#: planner 和 replyer 是两次独立的 hook 调用，中间隔着一次模型生成，插件
+#: 没有别的办法把结论传下去。窗口给 3 分钟：一轮 planner→replyer 正常几秒到
+#: 几十秒，给太短会漏，给太长会把「这一轮」的话带到下一轮去。
+_DISSENT_WINDOW_SECONDS = 180.0
 
 #: 宿主 planner 快照里「系统消息」这个 item 的类型名。
 #:
@@ -183,12 +204,17 @@ _INJECT_KW: dict[str, Any] = {
     "timeout_ms": INJECT_TIMEOUT_MS,
     "description": "把情境连续性线索追加到本轮 replyer 的 extra_prompt",
 }
-#: 观察 Bot 自己的回复。用 OBSERVE 而不是 BLOCKING：情绪只影响下一轮，
-#: 绝不能改写已经生成好的回复。
+#: 观察 Bot 自己的回复。用 BLOCKING 而不是 OBSERVE：OBSERVE 模式下宿主会
+#: 直接丢掉我们返回的 ``modified_kwargs``（``hook_dispatcher.py:695-696``），
+#: 而「这一句没冷下来，重说一遍」只能靠回传 ``retry`` 实现。
+#:
+#: 为什么必须亲自动手：人设里写着「喜欢用颜文字」「语气自然轻快」，
+#: 还有 ``reply_style`` 那一整段，模型经常一句就把话说软了。**光靠提示词
+#: 约束不够**——实测这一层没有重试纠偏机制，一次生成成什么样就是什么样。
 _REPLY_KW: dict[str, Any] = {
     "name": "observe_reply",
     "timeout_ms": CAPTURE_TIMEOUT_MS,
-    "description": "记录 Bot 刚发出的回复，用于更新自身情绪",
+    "description": "记录 Bot 刚发出的回复，用于更新自身情绪；必要时要求重生成",
 }
 #: planner 侧的状态注入。宿主这个 hook 默认预算也是 6000ms；它只读内存与
 #: 本地 SQLite，没有任何网络调用，所以和 inject 用同一个收紧值。
@@ -209,7 +235,7 @@ if _HOOK_ENUMS:
         error_policy=ErrorPolicy.SKIP,
     )
     _REPLY_KW.update(
-        mode=HookMode.OBSERVE,
+        mode=HookMode.BLOCKING,
         order=HookOrder.NORMAL,
         error_policy=ErrorPolicy.SKIP,
     )
@@ -311,6 +337,29 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         # 状态（不在那 75 项能力清单里），所以自己数——数到这里就等于「下一枪
         # 打完这个 hook 会被静默跳过」。
         self._gate_slow_streak: int = 0
+        # 「这一轮她不打算顺着」的会话标记：session_id → 失效时刻。
+        #
+        # planner 和 replyer 是**两次独立的 hook 调用**，中间隔着一次模型生成，
+        # 插件没有办法把状态顺着调用栈传下去。所以判在 planner、用在 replyer，
+        # 只能靠这个短期标记。窗口给 3 分钟：一轮 planner→replyer 正常几秒到
+        # 几十秒，给太短会漏、给太长会把「这一轮」的话带到下一轮去。
+        self._dissent_until: dict[str, float] = {}
+        # 上一次真的不顺着是什么时候（进程级）。配合 thought.frequency_hours 限速。
+        self._dissent_last_ts: float = 0.0
+        # 当天已经用掉几次。跨重启会归零——这是可接受的：重启本来就是新的一天
+        # 这个量级的误差，不值得为它加一张表。
+        self._dissent_day: str = ""
+        self._dissent_day_count: int = 0
+        # 这一轮是否已经进入「不顺着」的流程，以及本轮已经重生成过几次。
+        #
+        # **按会话记，不是全局一个布尔。** 宿主可以同时跑多个会话（群聊和私聊
+        # 各一轮），全局布尔会让 A 组打开的轮次把 B 组的正常回复也拉回去重
+        # 生成——而且 B 组一旦重生成，又会把 A 组的计数搅乱。
+        #
+        # 用字典而不是从 ``_dissent_until`` 反推：那个标记是「给 replyer 的
+        # 时限」，而这里要记的是「这一轮重说了几次」，两者寿命不一样。
+        # 键存在 = 这一轮在流程里；值 = 已用掉的重生成次数。
+        self._dissent_rounds: dict[str, int] = {}
 
     # ── 配置 ──
 
@@ -549,12 +598,25 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
 
     @HookHandler("maisaka.replyer.after_response", **_REPLY_KW)
     async def observe_reply(self, **kwargs: Any) -> dict[str, Any]:
-        """记录 Bot 自己刚说的话，用于更新情绪。
+        """记录 Bot 自己刚说的话；如果这一轮该冷下来却没冷，要求重说。
 
-        OBSERVE 模式意味着返回值不影响宿主；即使这里抛异常也只是跳过。
-        情绪只作用于**下一轮**回复，不会改写已经发出去的内容。
+        两件事共用这条 hook：
+
+        - **情绪**（一直都有）：只影响下一轮，不改写已经发出去的内容。
+        - **冷场兜底**（新增）：planner 那一轮判了「不顺着」，但生成出来的
+          这句话被 ``cg_dissent.judge_coldness`` 判成「还是太软」，就带上
+          ``retry_reason`` 让宿主重生成一次。
+
+        为什么判据是规则而不是再调一次 LLM：这条 hook 的预算是 6000ms，
+        判完还要再生成一次，再塞一次模型调用会直接把预算吃穿。而且规则
+        可解释——日志里能写出「她这句带了缓和词（呀）」这种话，模型判不出。
+
+        **返回必须裹在 ``modified_kwargs`` 里。** 宿主拿到 hook 结果后只读
+        ``modified_kwargs`` 再整体覆盖 kwargs（``hook_dispatcher.py:576-578``），
+        把 ``retry`` 放在顶层会被直接丢掉——写了等于没写。
         """
 
+        result: dict[str, Any] = {"action": "continue"}
         try:
             mood = self._mood
             if mood is not None:
@@ -562,8 +624,81 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
                 if text:
                     mood.on_reply(text)
         except Exception as exc:  # noqa: BLE001
-            self._warn(f"observe_reply 失败: {exc!r}")
-        return {"action": "continue"}
+            self._warn(f"observe_reply 更新情绪失败: {exc!r}")
+
+        try:
+            request = self._dissent_retry_request(kwargs)
+        except Exception as exc:  # noqa: BLE001 - 兜底失败就放行，不能拖累发送
+            self._warn(f"冷场兜底判定失败（按已冷处理）: {exc!r}")
+            request = None
+        if request is not None:
+            # modified_kwargs 是整体替换语义，必须回传完整副本。
+            out_kwargs = dict(kwargs)
+            out_kwargs.update(request)
+            result["modified_kwargs"] = out_kwargs
+        return result
+
+    def _dissent_retry_request(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+        """「该冷却没冷」时返回要给宿主的 retry 参数，否则 ``None``。
+
+        只在 planner 那一轮真的判了「不顺着」时才生效——平时回复里多一个
+        「哈哈」是再正常不过的事，绝不能因为全局检查把她所有回复都拉回去
+        重说一遍。
+        """
+
+        cfg = self.config
+        thought_cfg = getattr(cfg, "thought", None)
+        if thought_cfg is None or not bool(getattr(thought_cfg, "enabled", True)):
+            return None
+        if not bool(getattr(thought_cfg, "retry_enabled", True)):
+            return None
+
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if not self._dissent_consumed_gate(session_id):
+            return None
+
+        text = str(kwargs.get("response") or "")
+        if not text:
+            self._dissent_end_round(session_id)
+            return None
+
+        max_chars = int(getattr(thought_cfg, "dissent_max_chars", DISSENT_MAX_CHARS) or DISSENT_MAX_CHARS)
+        verdict = judge_coldness(text, max_chars=max_chars)
+        if verdict.cold:
+            self._debug(f"冷场兜底：这一句够冷了（{describe_coldness(verdict)}）")
+            self._dissent_end_round(session_id)
+            return None
+
+        used = self._dissent_rounds.get(session_id, 0)
+        limit = int(getattr(thought_cfg, "retry_max", 1) or 0)
+        if used >= limit:
+            self._info(
+                f"冷场兜底：已经重生成 {used} 次仍然偏软，就用这一句"
+                f"（{verdict.reason}）：{text[:60]}"
+            )
+            self._dissent_end_round(session_id)
+            return None
+        self._dissent_rounds[session_id] = used + 1
+        self._info(f"冷场兜底：这一句太软（{verdict.reason}），要求重生成：{text[:60]}")
+        return {
+            "retry": True,
+            "retry_reason": (
+                "刚才那句话太软了。不要附和、不要补缓和的话、不要解释，"
+                "也不要加语气词和表情——只说你自己真正想说的那一句，说完就完。"
+            ),
+        }
+
+    def _dissent_consumed_gate(self, session_id: str) -> bool:
+        """这个会话的这一轮是否被判过「不顺着」。
+
+        **按会话查，不能用一个全局布尔。** 宿主能同时跑多个会话，全局布尔会
+        让 A 组打开的轮次把 B 组正常的回复也拉回去重生成。
+
+        轮次边界就是「这一轮的重生成全部结束」：够冷 / 到了重试上限时由
+        ``_dissent_retry_request`` 把它清掉，所以下一轮不会继承。
+        """
+
+        return str(session_id or "").strip() in self._dissent_rounds
 
     # ── 组件：注入情境 ──
 
@@ -587,9 +722,10 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         ``Alcpare_identity`` 用的是同一套写法（宿主允许改 items 的前提是
         ``item_schema_version`` 原样回传、item_id 唯一）。
 
-        **两件事共用这一个 hook，但互不依赖**：边界感那段文字（默认可关）
-        和自主发言闸门（默认关，收紧 ``tool_definitions``）。所以下面拆成
-        两个 try 块——任何一边失败或提前返回，都不能连带把另一边也跳过。
+        **三件事共用这一个 hook，但互不依赖**：边界感那段文字（默认可关）、
+        自主发言闸门（默认关，收紧 ``tool_definitions``）、念头（默认开，
+        决定这一轮要不要让她不顺着）。所以下面拆成三个 try 块——任何一边
+        失败或提前返回，都不能连带把另外两边也跳过。
         """
 
         out = dict(kwargs)
@@ -597,6 +733,14 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
             out = self._inject_planner_boundary(out, **kwargs)
         except Exception as exc:  # noqa: BLE001 - planner 注入失败绝不能拖累决策
             self._warn(f"planner 状态注入失败: {exc!r}")
+
+        # ── 念头 ──────────────────────────────────────────────────────
+        # 先判念头再判发言闸门：闸门决定「这一轮说不说」，念头决定「如果要说，
+        # 是怎么说」。两者语义正交，顺序不影响结果，但日志读起来更顺。
+        try:
+            out = self._apply_thought_note(out, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - 念头失败退回「正常聊」
+            self._warn(f"念头注入失败（退回正常回复）: {exc!r}")
 
         # ── 自主发言闸门 ──────────────────────────────────────────────
         # 必须**无条件**跑：它改的是工具清单，和上面有没有注入哪段文字无关。
@@ -631,35 +775,236 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         if not note:
             return out
 
+        self._append_system_note(out, note, tag="boundary")
+        self._debug(f"planner 状态已注入（{len(note)} 字）")
+        return out
+
+    def _apply_thought_note(self, out: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        """决定这一轮有没有一个「心里的念头」，并把它的存在交给模型。
+
+        三个入口，按可信度从高到低：
+
+        1. **当场信号**（``cg_dissent.analyse_signals``）：同一件事问到第三遍、
+           对方连着敷衍、近几轮全是问句。这些是刚发生的、能从对话里指出来
+           的事实，最硬。
+        2. **被勾起的念头**（``cg_thought.pick_echo``）：当前话题撞上了她心里
+           存着的那条念头的来源。这是「自然回响」，Kimi 说的主要去处。
+        3. **什么都发生**：不注入、不记账、不惩罚。
+
+        判完之后把「这一轮不顺着」这个结论写进 ``self._dissent_until``，
+        由 ``inject_context``（replyer 侧）取用。**planner 和 replyer 是两次
+        独立的 hook 调用**，中间隔着一次模型生成，没有别的办法把状态传过去。
+
+        频率限制放在这里而不是 replyer 侧：这是唯一一次「还能选择不说」的
+        机会，到 replyer 那步已经晚了。
+        """
+
+        out_kwargs = dict(out)
+        cfg = self.config
+        thought_cfg = getattr(cfg, "thought", None)
+        store = self._store
+        tracker = self._tracker
+        if thought_cfg is None or store is None or tracker is None:
+            return out_kwargs
+        if not bool(getattr(thought_cfg, "enabled", True)):
+            return out_kwargs
+
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if not session_id:
+            return out_kwargs
+
+        now = time.time()
+        cfg_dissent = bool(getattr(thought_cfg, "dissent_enabled", True))
+        cfg_signals = bool(getattr(thought_cfg, "instant_signals", True))
+
+        # ── 当场信号 ──────────────────────────────────────────────
+        signal = None
+        if cfg_signals:
+            try:
+                incoming = tracker.recent_incoming(session_id, limit=12)
+                text = self._planner_user_text(kwargs)
+                signal = analyse_signals(incoming, current=text)
+            except Exception as exc:  # noqa: BLE001 - 算不出来就当没信号
+                self._debug(f"当场信号计算失败（按无信号处理）: {exc!r}")
+        reason = signal.reason if signal is not None and signal.fired else ""
+
+        # ── 被勾起的念头 ─────────────────────────────────────────
+        echo = None
+        if bool(getattr(thought_cfg, "echo_enabled", True)):
+            try:
+                rows = store.list_thoughts(session_id, limit=6)
+                current = self._current_message(kwargs)
+                echo = pick_echo(to_thoughts(rows), current)
+            except Exception as exc:  # noqa: BLE001
+                self._debug(f"念头唤起失败（按没想起处理）: {exc!r}")
+            if echo is not None:
+                try:
+                    store.touch_thought(echo.thought.id, now=now)
+                except Exception as exc:  # noqa: BLE001
+                    self._debug(f"touch_thought 失败: {exc!r}")
+                if not reason:
+                    reason = f"想起了「{echo.thought.content[:20]}」"
+
+        # ── 这一轮要不要真的不顺着 ────────────────────────────────
+        # 硬条件：开关 + 有理由 + 没被限速。三条都过了才写标记。
+        allow_dissent = False
+        block_reason = ""
+        if not cfg_dissent:
+            block_reason = "dissent_enabled 关着"
+        elif not reason:
+            block_reason = "没有触发理由"
+        else:
+            blocked, why = self._dissent_rate_limited(thought_cfg, now)
+            if blocked:
+                block_reason = why
+            else:
+                allow_dissent = True
+
+        # 无论放不放行，先把念头本身告诉 planner ——「你心里有件事没放下」
+        # 和「这一轮要不要冷下来」是两个决定。念头被记起来了却决定正常聊，
+        # 是完全正常的一天。
+        note = ""
+        if echo is not None and bool(getattr(thought_cfg, "echo_enabled", True)):
+            try:
+                note = render_planner_note(echo.thought)
+            except Exception as exc:  # noqa: BLE001
+                self._debug(f"渲染念头失败: {exc!r}")
+
+        if signal is not None and signal.fired:
+            extra = f"（{signal.reason}）"
+            note = (note + "\n" if note else "") + extra
+
+        if note:
+            self._append_system_note(out_kwargs, note)
+            self._debug(f"planner 念头已注入：{note[:80]}")
+
+        if allow_dissent:
+            self._dissent_record(thought_cfg, session_id, now)
+            if echo is not None:
+                try:
+                    store.voice_thought(echo.thought.id, now=now)
+                except Exception as exc:  # noqa: BLE001
+                    self._debug(f"voice_thought 失败: {exc!r}")
+            self._info(
+                f"念头：这一轮她不想顺着（{reason}）"
+                f"{'；' + describe_echo(echo) if echo is not None else ''}"
+            )
+        elif reason:
+            self._debug(f"念头：有理由但不触发（{reason}；{block_reason}）")
+        return out_kwargs
+
+    def _dissent_active(self, session_id: str, *, now: float | None = None) -> bool:
+        """这个会话还有没有「这一轮不顺着」的标记。
+
+        **不删标记。** 因为被要求重生成时 replyer 会被再调一次
+        （``replyer.before_request`` → 生成 → ``after_response`` 要求重试 →
+        再走一遍），那一次正是最需要这段指令的时候。标记的清除交给
+        ``_dissent_end_round``：一轮结束（够冷 / 到了重试上限）或 3 分钟到期。
+        """
+
+        current = time.time() if now is None else float(now)
+        key = str(session_id or "").strip()
+        until = self._dissent_until.get(key, 0.0)
+        if until <= 0.0:
+            return False
+        if until < current:
+            self._debug("念头标记已过期（这一轮没走到 replyer）")
+            self._dissent_until.pop(key, None)
+            self._dissent_rounds.pop(key, None)
+            return False
+        # 进入「这一轮不顺着」的流程。次数只在**本轮第一次**进来时建立：
+        # 重生成会把 replyer 再调一次，那一次不能覆盖已有计数，否则
+        # ``retry_max`` 就永远撞不到上限。
+        self._dissent_rounds.setdefault(key, 0)
+        return True
+
+    def _dissent_end_round(self, session_id: str) -> None:
+        """这一轮不顺着结束（说出来了，或者到了重试上限就用这句）。"""
+
+        key = str(session_id or "").strip()
+        self._dissent_rounds.pop(key, None)
+        self._dissent_until.pop(key, None)
+
+    def _dissent_rate_limited(self, thought_cfg: Any, now: float) -> tuple[bool, str]:
+        """限速判定。返回 ``(是否被拦, 原因)``。
+
+        两道：最短间隔 + 每日上限。**两道都要**——只有间隔的话，一天里
+        「每隔 6 小时冷一次」正好撞上用户的作息；只有上限的话，四次都挤在
+        同一小时里，那读起来不像她有自己的节奏，像开关。
+        """
+
+        hours = float(getattr(thought_cfg, "frequency_hours", 6.0) or 0.0)
+        if hours > 0.0 and self._dissent_last_ts > 0.0:
+            gap = now - self._dissent_last_ts
+            if gap < hours * 3600.0:
+                left = hours * 3600.0 - gap
+                return True, f"距上次不顺着才 {gap / 60.0:.0f} 分钟（还差 {left / 60.0:.0f} 分钟）"
+
+        limit = int(getattr(thought_cfg, "daily_limit", 2) or 0)
+        today = time.strftime("%Y-%m-%d", time.localtime(now))
+        if today != self._dissent_day:
+            self._dissent_day = today
+            self._dissent_day_count = 0
+        if limit > 0 and self._dissent_day_count >= limit:
+            return True, f"今天已经不顺着 {self._dissent_day_count} 次（上限 {limit}）"
+        return False, ""
+
+    def _dissent_record(self, thought_cfg: Any, session_id: str, now: float) -> None:
+        """记下「这一轮真的不顺着」，并给 replyer 侧留标记。"""
+
+        self._dissent_last_ts = now
+        today = time.strftime("%Y-%m-%d", time.localtime(now))
+        if today != self._dissent_day:
+            self._dissent_day = today
+            self._dissent_day_count = 0
+        self._dissent_day_count += 1
+        # 3 分钟：一轮 planner→replyer 正常几秒到几十秒。给太短会漏，
+        # 给太长会把「这一轮」的话带到下一轮去。
+        self._dissent_until[session_id] = now + _DISSENT_WINDOW_SECONDS
+        # 顺手清掉过期的，别让这个字典无限长（群多了会积）。
+        stale = [key for key, until in self._dissent_until.items() if until < now]
+        for key in stale:
+            self._dissent_until.pop(key, None)
+
+    def _append_system_note(self, out: dict[str, Any], note: str, *, tag: str = "thought") -> None:
+        """往 planner 的 items 里追加一段系统消息。
+
+        抽出来是因为现在有两处要往里加文字（边界感、念头），而 item 的构造
+        细节很容易改一处忘一处：``item_type`` 必须是宿主认识的类名、
+        ``item_id`` 必须唯一、``meta.timestamp`` 必须是能 ``fromisoformat``
+        的串。**不复制粘贴第二份。**
+
+        Args:
+            out: planner 的 kwargs 副本，原地修改。
+            note: 要追加的文字。
+            tag: 新建 item 时 item_id 里的前缀，方便在日志里认出来源。
+        """
+
         items = out.get("items")
         if not isinstance(items, list):
-            return out
-
-        appended = False
+            return
         for item in reversed(items):
-            if isinstance(item, dict) and item.get("item_type") == "SystemMessageItem":
+            if isinstance(item, dict) and item.get("item_type") in _SYSTEM_ITEM_TYPES:
                 parts = item.get("parts")
                 if not isinstance(parts, list):
                     parts = []
                     item["parts"] = parts
                 parts.append({"type": "text", "text": note})
-                appended = True
-                break
-        if not appended:
-            items.insert(
-                0,
-                {
-                    "item_type": "SystemMessageItem",
-                    "meta": {
-                        "item_id": f"companion-gap-boundary-{uuid.uuid4().hex}",
-                        "logical_turn_id": None,
-                        "timestamp": datetime.now().astimezone().isoformat(),
-                    },
-                    "parts": [{"type": "text", "text": note}],
+                return
+        items.insert(
+            0,
+            {
+                # 必须是宿主认识的类名。写 "system" 会被
+                # request_snapshot.deserialize 拒掉，然后**整批 items 被丢弃**。
+                "item_type": "SystemMessageItem",
+                "meta": {
+                    "item_id": f"companion-gap-{tag}-{uuid.uuid4().hex}",
+                    "logical_turn_id": None,
+                    "timestamp": datetime.now().astimezone().isoformat(),
                 },
-            )
-        self._debug(f"planner 状态已注入（{len(note)} 字）")
-        return out
+                "parts": [{"type": "text", "text": note}],
+            },
+        )
 
     def _apply_initiative_gate(self, out: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         """按「兴趣 / 好感度 / 心情」决定这一轮要不要开口。
@@ -1008,9 +1353,20 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
             except Exception as exc:  # noqa: BLE001 - 翻记录失败不影响回复
                 self._warn(f"翻聊天记录失败（已跳过）: {exc!r}")
 
+            # 念头的「不顺着」指令。**放在最后一段**——它是关于「怎么说」的
+            # 要求，不是背景信息，前面那些是「你现在是什么状态」。混在一起
+            # 会让模型把「不必顺着」当成又一个状态描述。
+            #
+            # 这里判断的是 planner 那一轮留下的标记：planner 已经决定了这一轮
+            # 她不想顺着，replyer 这一步的活只是别把它又劝回去。标记过期之后
+            # 什么都不会发生，不需要有人负责清。
+            dissent_text = ""
+            if self._dissent_active(session_id):
+                dissent_text = render_dissent_block()
+
             # 统一拼接。顺序即重要性：情绪 → 边界 → 缺席 → 人物 → 记忆
-            # → 跨流 → 想起 → 口味。原来这里是层层嵌套的三元式，每加一段就要
-            # 重写一次，加到最后没人敢动；改成一次性列表拼接。
+            # → 跨流 → 想起 → 口味 → 念头。原来这里是层层嵌套的三元式，
+            # 每加一段就要重写一次，加到最后没人敢动；改成一次性列表拼接。
             segments = (
                 mood_text,
                 boundary_text,
@@ -1022,6 +1378,7 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
                 cross_text,
                 recall_text,
                 prefs_text,
+                dissent_text,
             )
             merged = "\n\n".join(part for part in segments if part)
             if not merged:

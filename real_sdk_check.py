@@ -788,7 +788,13 @@ def main() -> int:
         hooks["observe_reply"]["hook"] == "maisaka.replyer.after_response",
         "observe_reply 挂在 replyer.after_response（观察 Bot 自己说了什么）",
     )
-    check(hooks["observe_reply"]["mode"] == HookMode.OBSERVE.value, "observe_reply 是 OBSERVE（不改写回复）")
+    # after_response 从 OBSERVE 改成 BLOCKING 是「冷场兜底」的前提：
+    # 观察型处理器返回的 modified_kwargs 会被宿主直接丢掉
+    # （hook_dispatcher.py:695-696），而 retry 只可能通过回传生效。
+    check(
+        hooks["observe_reply"]["mode"] == HookMode.BLOCKING.value,
+        "observe_reply 是 BLOCKING（重生成只能靠回传 kwargs）",
+    )
     check(hooks["inject_context"]["mode"] == HookMode.BLOCKING.value, "inject 是 BLOCKING")
     check(hooks["inject_context"]["order"] == HookOrder.LATE.value, "inject 是 LATE")
     check(hooks["inject_context"]["error_policy"] == ErrorPolicy.SKIP.value, "inject 是 SKIP")
@@ -855,6 +861,7 @@ def main() -> int:
         "backfill",
         "initiative",
         "history",
+        "thought",
         "debug",
     ):
         check(expected in sections, f"schema 含 {expected} 节")
@@ -876,7 +883,7 @@ def main() -> int:
                 plain_labels.append(f"[{section_name}].{field_name}={label!r}")
             if not hint or not _has_cjk(hint):
                 plain_hints.append(f"[{section_name}].{field_name}={hint!r}")
-    check(field_total == 170, f"schema 共 170 个配置项（实际 {field_total}）")
+    check(field_total == 179, f"schema 共 179 个配置项（实际 {field_total}）")
     check(not plain_labels, f"每个配置项的 label 都是中文（问题项 {plain_labels}）")
     check(not plain_hints, f"每个配置项的 hint 都是中文（问题项 {plain_hints}）")
 

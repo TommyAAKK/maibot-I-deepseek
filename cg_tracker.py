@@ -31,7 +31,7 @@ from .cg_backfill import (
 )
 from .cg_extract import format_transcript, frame_self_lines, run_extraction
 from .cg_guard import system_text_reason
-from .cg_history import describe_span, split_window, summarize_hole, to_history_rows
+from .cg_history import describe_span, message_text, split_window, summarize_hole, to_history_rows
 from .cg_person import (
     accumulate_impact,
     affection_from_axes,
@@ -48,9 +48,18 @@ from .cg_person import (
 )
 from .cg_prefs import merge_pref, normalize_topic, prefs_key
 from .cg_store import GapStore, similarity
+from .cg_thought import ttl_seconds
 
 #: 单次抽取失败后的退避时间（秒），避免模型报错时每 tick 都重试。
 FAILURE_BACKOFF_SECONDS = 120.0
+
+#: 每个会话在内存里保留多少条入站正文。当场信号只看最近 6~8 条，
+#: 留 40 条是给「多挂几个不同窗口」留的余量，也防着将来有人把窗口调大。
+_INCOMING_KEEP = 40
+
+#: 入站正文的有效期（秒）。超过这么久没新消息就当成对话断了——
+#: 昨天连问三遍和现在连问三遍是两件事。
+_INCOMING_WINDOW_SECONDS = 900.0
 
 #: 情绪状态落盘的最小间隔（秒）。情绪在内存里每次消息都在变，但没必要
 #: 每条消息都写一次磁盘——崩了最多丢这么多秒的漂移，而衰减本来就是连续的。
@@ -99,6 +108,12 @@ class DirtySession:
     at_ts: float = 0.0
     #: 最近一条「提到她名字」的消息到达时间，同上。
     mentioned_ts: float = 0.0
+    #: 最近的入站消息正文（按时间升序，滚动保留）。
+    #:
+    #: 当场信号要判「同一件事问了几遍」「连着几条在敷衍」「近几轮全是问句」，
+    #: 这三件事都只看最近几分钟，没有必要往库里写——它们也**不该**进记忆。
+    #: 数据只在内存里，进程重启就没了，那正是想要的。
+    incoming: list[str] = field(default_factory=list)
 
 
 class SessionTracker:
@@ -200,6 +215,18 @@ class SessionTracker:
             nickname = user_info.get("user_cardname") or user_info.get("user_nickname")
             entry.user_nickname = str(nickname or entry.user_nickname or "")
 
+        # 入站正文留给当场信号用。**跳过她自己的消息**：判断「对方在敷衍她」
+        # 用的必须是对方说的话，把她自己的回复混进窗口会立刻把连续敷衍
+        # 打断成 0。她的账号从差集学出来之前学不到，那时候宁可多留几条。
+        speaker = str((user_info or {}).get("user_id") or "") if isinstance(user_info, dict) else ""
+        if speaker and speaker in self._self_ids:
+            return
+        text = message_text(message)
+        if text:
+            entry.incoming.append(text)
+            if len(entry.incoming) > _INCOMING_KEEP:
+                del entry.incoming[: -_INCOMING_KEEP]
+
     # ── 后台任务 ──
 
     def recent_attention(
@@ -228,6 +255,33 @@ class SessionTracker:
         at_recent = entry.at_ts > 0 and current - entry.at_ts <= window
         mentioned_recent = entry.mentioned_ts > 0 and current - entry.mentioned_ts <= window
         return at_recent, mentioned_recent
+
+    def recent_incoming(
+        self,
+        session_id: str,
+        *,
+        limit: int = 12,
+        now: float | None = None,
+        within: float = _INCOMING_WINDOW_SECONDS,
+    ) -> list[str]:
+        """这个会话最近对方说的几句话（升序）。
+
+        给当场信号用。超过 ``within`` 秒没有新消息就当成「对话断了」返回空：
+        昨天连问三遍和现在连问三遍是两件事，把中间隔了一夜的记录也算进来，
+        她会对着一个已经换了话题的人发火。
+
+        Returns:
+            正文列表，可能为空。
+        """
+
+        entry = self._dirty.get(str(session_id or "").strip())
+        if entry is None:
+            return []
+        current = time.time() if now is None else float(now)
+        if entry.last_seen_ts > 0 and current - entry.last_seen_ts > float(within):
+            return []
+        keep = max(1, int(limit))
+        return list(entry.incoming[-keep:])
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -279,6 +333,19 @@ class SessionTracker:
                 self._info(f"清理过期条目 {expired} 条")
         except Exception as exc:  # noqa: BLE001
             self._warn(f"expire_stale 失败: {exc!r}")
+
+        # 念头的过期与失效。和记忆分开走，因为它有两条独立的死法：
+        # ① 到期（TTL 按显著度算出来的那个时间点）；
+        # ② **来源没了**——念头引用的是记忆条目，那条记忆被遗忘或删掉之后，
+        #    这个念头就不再有任何现实依据，留着只会变成凭空的臆测。
+        #    这是「念头不能升级成事实」那条约束的兜底执行点。
+        try:
+            gone = self._store.expire_thoughts()
+            orphan = self._store.prune_orphan_thoughts()
+            if gone or orphan:
+                self._debug(f"念头过期 {gone} 条，因来源失效作废 {orphan} 条")
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"expire_thoughts / prune_orphan_thoughts 失败: {exc!r}")
 
         # 衰减与遗忘：闲置越久显著度越低，淡到阈值以下就转 forgotten。
         # 放在 expire_stale 之后，因为两者互不依赖，但「过期」比「遗忘」更
@@ -633,6 +700,7 @@ class SessionTracker:
         resolved_count = 0
         people_written = 0
         prefs_written = 0
+        thoughts_written = 0
         if result.ok:
             resolved_count = self._apply_resolved(entry.session_id, result.resolved)
             written = self._apply_items(entry.session_id, result.items)
@@ -641,6 +709,7 @@ class SessionTracker:
                 people_written = self._apply_people(entry, result.people)
             if prefs_enabled:
                 prefs_written = self._apply_prefs(result.prefs)
+            thoughts_written = self._apply_thoughts(entry.session_id, result.thoughts)
 
         try:
             self._store.record_extraction(
@@ -660,9 +729,10 @@ class SessionTracker:
             self._warn(f"会话 {entry.session_id} 抽取未成功: {result.error}")
         else:
             people_note = f", 人物 {people_written} 条" if people_written else ""
+            thought_note = f", 念头 {thoughts_written} 条" if thoughts_written else ""
             self._info(
                 f"会话 {entry.session_id} 抽取完成: 新增/合并 {written} 条, "
-                f"解决 {resolved_count} 条{people_note}, 模型={result.model or '?'}"
+                f"解决 {resolved_count} 条{people_note}{thought_note}, 模型={result.model or '?'}"
             )
         if self._log_extract_raw and result.raw_response:
             self._debug(f"会话 {entry.session_id} 模型原始返回:\n{result.raw_response[:2000]}")
@@ -1073,6 +1143,64 @@ class SessionTracker:
             self._store.trim_session(session_id, max_items, now=now)
         except Exception as exc:  # noqa: BLE001
             self._warn(f"trim_session 失败: {exc!r}")
+        return written
+
+    def _apply_thoughts(self, session_id: str, thoughts: list[dict[str, Any]]) -> int:
+        """把抽取出来的念头写进 ``gap_thoughts``。
+
+        **只写念头表，绝不写进 ``gap_items``。** 这条是结构约束不是风格偏好：
+        念头一旦能进记忆库，就会和「已知的事实」混在一起，然后按记忆的规则
+        被注入、被引用、被当成依据——「我猜他不开心 → 我想关心他 → 我确实
+        知道他不对劲」这个循环就是这么转起来的。它进不了记忆，就转不起来。
+
+        TTL 按显著度映射（40 分钟 ~ 36 小时），所以「一时的联想」和「没聊完
+        的事」自己会分层，不需要人手调。
+        """
+
+        config = self._config()
+        thought_cfg = getattr(config, "thought", None)
+        if thought_cfg is not None and not bool(getattr(thought_cfg, "enabled", True)):
+            return 0
+        if not thoughts:
+            return 0
+
+        now = time.time()
+        written = 0
+        for thought in thoughts:
+            content = str(thought.get("content") or "").strip()
+            source_text = str(thought.get("source") or "").strip()
+            if not content or not source_text:
+                # 没有来源的念头一律不要（cg_extract 那边已经丢过一遍，
+                # 这里再挡一次——两道防线，因为这个约束太容易被后来的改动破坏）。
+                continue
+            dirty = system_text_reason(content)
+            if dirty:
+                self._warn(f"丢弃疑似系统文本的念头（{dirty}）: {content[:120]}")
+                continue
+            try:
+                salience = float(thought.get("salience") or 0.5)
+            except (TypeError, ValueError):
+                salience = 0.5
+            try:
+                self._store.add_thought(
+                    session_id,
+                    kind=str(thought.get("kind") or "dissent"),
+                    content=content,
+                    source_kind="text",
+                    source_id=0,
+                    source_text=source_text,
+                    salience=salience,
+                    expires_at=now + ttl_seconds(salience),
+                    now=now,
+                )
+                written += 1
+            except Exception as exc:  # noqa: BLE001
+                self._warn(f"add_thought 失败: {exc!r}")
+
+        try:
+            self._store.trim_thoughts(session_id, keep=40)
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"trim_thoughts 失败: {exc!r}")
         return written
 
     def _apply_resolved(self, session_id: str, resolved: list[str]) -> int:

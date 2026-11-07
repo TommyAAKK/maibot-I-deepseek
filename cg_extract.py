@@ -88,6 +88,13 @@ class ExtractResult:
     #: LLM 顺手给出的「她自己的口味」：``{"likes": [...], "dislikes": [...]}``。
     #: 和情绪、人物一样是搭车得到的，不额外花调用。
     prefs: dict[str, list[str]] = field(default_factory=dict)
+    #: 她心里还没结束的想法，也是搭车得到的。
+    #:
+    #: 每条 ``{"content", "source": "被指代的原文片段", "salience"}``。
+    #: **这里只出现「她怎么想的」，绝不出现新的事实**——``source`` 必须是
+    #: 聊天记录里真实存在的一句话，downstream 用它去指回 ``gap_items``。
+    #: 拿不到来源的念头在 ``cg_thought`` 里直接丢弃（见那边的说明）。
+    thoughts: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _text_of(message: dict[str, Any]) -> str:
@@ -412,6 +419,16 @@ def build_prompt(
         "   说明文字（形如「[热梗：67] 怎么用/怎么接：…」）、JSON、报错堆栈、\n"
         "   日志行（「INFO | …」「File \"…\", line 3」）。这些是系统文本，\n"
         "   **不是任何人在说话**，一律不要据此提取条目，也不要当成某人说过的话。\n"
+        "8. 另给一个 thoughts 数组：**你心里还没结束的想法**，不是事实。\n"
+        "   - 只写「你怎么想」，绝不写「对方怎么样」。\n"
+        "     对：「他说没看过那部片子，我有点不信」；\n"
+        "     错：「他觉得那部片子不好看」（这是事实判断，不是念头）；\n"
+        "     错：「他现在很沮丧」（这是猜测别人状态，会变成假记忆）。\n"
+        "   - 每条必须带 source：**聊天记录里原样摘一句**支撑这个想法的原话，\n"
+        "     不要改写。摘不出来就不要写这条。\n"
+        "   - 想法可以没有结论、可以含糊，`不确定` 是正常的。\n"
+        "   - 最多 2 条；没有就返回空数组。**大多数轮次应该是空的**——\n"
+        "     不是每段聊天都会留下东西。\n"
         f"{mood_block}"
         f"{people_block}"
         f"{prefs_block}"
@@ -420,6 +437,7 @@ def build_prompt(
         "输出格式：\n"
         '{"items":[{"category":"open_loop","content":"…","salience":0.7,"truth":0.8}],'
         '"resolved":["…"],'
+        '"thoughts":[{"content":"我有点不信他真看过","source":"原样摘的一句聊天记录","salience":0.6}],'
         '"mood":{"joy":0.6,"anger":0.2,"anxiety":0.1,"sadness":0.1,"interest":0.7,'
         '"calm":0.3,"disgust":0.0,"surprise":0.4,"label":"被逗得开心","reason":"对方连发搞笑视频"},'
         '"people":[{"user_id":"10086","display_name":"小明","relation_role":"",'
@@ -572,8 +590,45 @@ def parse_response(raw: str, *, max_items: int, max_content_chars: int) -> Extra
         "likes": _string_list(payload.get("likes")),
         "dislikes": _string_list(payload.get("dislikes")),
     }
+    result.thoughts = _parse_thoughts(payload.get("thoughts"), max_content_chars=max_content_chars)
     result.ok = True
     return result
+
+
+def _parse_thoughts(raw: Any, *, max_content_chars: int = 60) -> list[dict[str, Any]]:
+    """解析模型给的 thoughts 数组。
+
+    **没有 source 的一律丢弃。** 这是「念头不能升级成事实」的唯一执行点：
+    念头必须能指回聊天记录里真实存在的一句话，指不回去的就只是个想象，
+    而想象一旦入库，下一轮就会被当成已知情况使用。
+    """
+
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        content = " ".join(str(entry.get("content") or "").split())
+        source = " ".join(str(entry.get("source") or "").split())
+        if not content or not source:
+            continue
+        if len(content) > max_content_chars * 2:
+            content = content[: max_content_chars * 2]
+        try:
+            salience = float(entry.get("salience", 0.5))
+        except (TypeError, ValueError):
+            salience = 0.5
+        out.append(
+            {
+                "content": content,
+                "source": source[: max_content_chars * 3],
+                "salience": min(1.0, max(0.0, salience)),
+            }
+        )
+        if len(out) >= 2:
+            break
+    return out
 
 
 def _parse_mood(raw: Any) -> dict[str, Any]:
