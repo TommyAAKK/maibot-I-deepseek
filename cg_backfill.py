@@ -99,12 +99,29 @@ def _unwrap_history(payload: Any) -> tuple[list[dict[str, Any]], str]:
 
     见过的形态：
     - 宿主剥壳后直接给的适配器原始响应 ``{"status":"ok","retcode":0,"data":{"messages":[...]}}``
+    - 宿主 RPC 层的失败壳 ``{"success": False, "error": "..."}``
     - 某些版本再包一层 ``{"success":True,"result":{...}}``
     - 直接给数组
+
+    ``success: False`` 这一支是补的，原因是**漏了它会造成谎报**：
+    2026-11-07 之前 ``ctx.api.call`` 的参数传法写错，适配器每次都
+    抛 ``unexpected keyword argument``，宿主包成 ``{"success": False,
+    "error": ...}`` 返回；而老版本这里认不出这个壳，落到最后
+    ``return [], ""``，也就是「0 条消息、没有错误」。于是补抓循环
+    认为「到底了」，日志打出「补抓 0 条，已到缓存尽头」——
+    一句谎话，而且盖住了真错误，害得「补抓从来没成功过」这件事
+    拖了两天才被发现。
 
     Returns:
         ``(messages, error)``。``error`` 非空时 ``messages`` 恒为空。
     """
+
+    # 宿主 RPC 的失败壳排在最前：它和下面的适配器响应长得不像，
+    # 但优先级最高——带 success 字段就说明这是 RPC 层给的判定，
+    # 不管里层还塞了什么。
+    if isinstance(payload, dict) and payload.get("success") is False:
+        detail = str(payload.get("error") or payload.get("result") or "").strip()
+        return [], f"宿主拒绝调用: {detail}" if detail else "宿主拒绝调用（无错误信息）"
 
     node = payload
     # 最多剥三层壳，够覆盖所有已知形态。
@@ -317,12 +334,30 @@ async def _call_history_api(
     api_name: str,
     params: dict[str, Any],
 ) -> Any:
-    """调用适配器 API，兼容 ``ctx.api.call`` 与裸 ``call_capability`` 两种写法。"""
+    """调用适配器 API，兼容 ``ctx.api.call`` 与裸 ``call_capability`` 两种写法。
+
+    **参数必须裹在 ``params=`` 里，不能展开成关键字参数。**
+
+    这条是踩出来的，代价是「历史补抓从上线起一次都没成功」：适配器的
+    签名是 ``async def api_action_get_friend_msg_history(self, params=None)``
+    ——**只接一个 ``params``**。而 ``ctx.api.call(name, **params)`` 会把
+    ``user_id`` / ``group_id`` 这些键当独立关键字传给那个方法，于是
+    ``TypeError: got an unexpected keyword argument 'user_id'``。
+
+    为什么之前没暴露：宿主把这个异常包成 ``{"success": False, "error": ...}``
+    返回，而 ``_unwrap_history`` 当时认不出这个壳，当成「0 条、无错误」，
+    日志就写成「补抓 0 条，已到缓存尽头」。错得越离谱越像正常。
+
+    另一个坑：这个 API 只吃 OneBot 原样的参数（``group_id`` / ``user_id``
+    / ``count`` / ``message_id`` …）。我们自己记账用的 ``_session_id`` /
+    ``_group_id`` / ``_group_name`` 绝不能混进去一起传，否则就算参数裹对了，
+    也是把无关字段塞给对端。
+    """
 
     api_proxy = getattr(ctx, "api", None)
     if api_proxy is not None and hasattr(api_proxy, "call"):
-        return await api_proxy.call(api_name, version="1", **params)
-    return await ctx.call_capability("api.call", api_name=api_name, version="1", args=params)
+        return await api_proxy.call(api_name, version="1", params=params)
+    return await ctx.call_capability("api.call", api_name=api_name, version="1", args={"params": params})
 
 
 async def fetch_history(
@@ -330,6 +365,10 @@ async def fetch_history(
     *,
     api_name: str,
     params_factory: Any,
+    platform: str = "qq",
+    session_id: str = "",
+    group_id: str = "",
+    group_name: str = "",
     since_ts: float = 0.0,
     page_size: int = PAGE_SIZE,
     max_pages: int = MAX_PAGES,
@@ -340,6 +379,10 @@ async def fetch_history(
     Args:
         api_name: 适配器 API 全名。
         params_factory: ``(anchor, count) -> dict``，由调用方决定锚点字段名。
+            **返回值只放适配器认识的键**——转发时会原样裹进 ``params=``。
+        platform / session_id / group_id / group_name: 我们自己的记账字段，
+            用来把适配器返回的原始事件转成宿主消息格式。**不发给对端**，
+            所以单独走形参，不从 ``params`` 里捞。
         since_ts: 只要比这个时间新的消息（unix 秒）。``0`` 表示不限。
     """
 
@@ -368,17 +411,19 @@ async def fetch_history(
             break
 
         added = 0
+        converted = 0
         oldest_stamp = 0.0
         for raw in rows:
             message = to_plugin_message(
                 raw,
-                platform=str(params.get("platform") or "qq"),
-                session_id=str(params.get("_session_id") or ""),
-                group_id=str(params.get("_group_id") or ""),
-                group_name=str(params.get("_group_name") or ""),
+                platform=platform,
+                session_id=session_id,
+                group_id=group_id,
+                group_name=group_name,
             )
             if not message:
                 continue
+            converted += 1
             key = message["message_id"]
             stamp = _stamp_of(message)
             if stamp > 0:
@@ -388,7 +433,16 @@ async def fetch_history(
             collected[key] = message
             added += 1
 
+        if converted == 0:
+            # 拿到了一页，但一条都转不成宿主格式 —— 这不是「到底了」，
+            # 是返回结构和我们认的不一样。必须报错，否则又一次谎报尽头。
+            result.error = (
+                f"适配器返回了 {len(rows)} 条原始消息，但没有一条能转成宿主格式"
+                f"（首条键: {sorted(rows[0].keys())[:10] if rows else []}）"
+            )
+            break
         if added == 0:
+            # 整页都是已经收过的（分页锚点没走动），继续翻只会原地打转。
             result.reached_start = True
             break
         if since_ts > 0 and oldest_stamp > 0 and oldest_stamp <= since_ts:
@@ -430,27 +484,17 @@ async def fetch_group_history(
 
     锚点用上一页第一条的 ``message_id``，``reverse_order=True`` 表示
     「这个锚点以及更早的」。这两个参数是实测出来的，见模块 docstring 的坑 1/2。
+
+    ``params`` 里**只放 OneBot 自己认识的键**（``group_id`` / ``count`` /
+    ``message_id`` / ``reverse_order``）。``platform``、``_session_id`` 这些
+    是我们记账用的，走 ``fetch_history`` 的独立形参。
     """
 
-    payload_summary: dict[str, Any] = {}
-
     def params_factory(anchor: Any, count: int) -> dict[str, Any]:
-        payload_summary.update(
-            {
-                "platform": platform,
-                "_session_id": session_id,
-                "_group_id": group_id,
-                "_group_name": group_name,
-            }
-        )
         params: dict[str, Any] = {
             "group_id": str(group_id),
             "count": count,
             "reverse_order": True,
-            "platform": platform,
-            "_session_id": session_id,
-            "_group_id": group_id,
-            "_group_name": group_name,
         }
         if anchor not in (None, ""):
             params["message_id"] = anchor
@@ -460,6 +504,10 @@ async def fetch_group_history(
         ctx,
         api_name=API_GROUP_HISTORY,
         params_factory=params_factory,
+        platform=platform,
+        session_id=session_id,
+        group_id=str(group_id),
+        group_name=group_name,
         since_ts=since_ts,
         page_size=page_size,
         max_pages=max_pages,
@@ -482,6 +530,8 @@ async def fetch_friend_history(
 
     **返回空列表是正常结果**，代表「这几天没有私聊」——用户明确纠正过这一点。
     调用方不要因为空就认为功能不可用。
+
+    私聊没有 ``group_id``，``to_plugin_message`` 拿不到群信息时会落到私聊分支。
     """
 
     def params_factory(anchor: Any, count: int) -> dict[str, Any]:
@@ -489,8 +539,6 @@ async def fetch_friend_history(
             "user_id": str(user_id),
             "count": count,
             "reverse_order": True,
-            "platform": platform,
-            "_session_id": session_id,
         }
         if anchor not in (None, ""):
             params["message_id"] = anchor
@@ -500,6 +548,10 @@ async def fetch_friend_history(
         ctx,
         api_name=API_FRIEND_HISTORY,
         params_factory=params_factory,
+        platform=platform,
+        session_id=session_id,
+        group_id="",
+        group_name="",
         since_ts=since_ts,
         page_size=page_size,
         max_pages=max_pages,

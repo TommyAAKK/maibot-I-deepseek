@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.TommyAAKK.maibot-I-deepseek",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "name": "我，deepseek",
   "description": "为 MaiBot 补充 A_Memorix 未覆盖的情境连续性记忆：未闭合话题、对方情绪、关系线索、自身连续性、共创线索，并在 replyer 阶段以额外回复要求的形式注入。",
   "author": {

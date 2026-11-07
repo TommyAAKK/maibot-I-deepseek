@@ -306,6 +306,67 @@ def _check_capability_usage_declared() -> None:
     check(not unused, f"manifest 没有声明用不到的能力（多出来的：{unused}）")
 
 
+def _check_api_call_style() -> None:
+    """扫源码里 ``ctx.api.call(...)`` 的调用方式。
+
+    防的是这一类：适配器 API 的签名是
+    ``async def api_action_xxx(self, params: Dict = None)`` ——**只接一个
+    ``params``**。而 ``ctx.api.call(name, **kwargs)`` 会把每个键当独立关键字
+    递给那个方法，于是 ``TypeError: got an unexpected keyword argument
+    'user_id'``。
+
+    这个错误为什么特别难发现：
+    1. 异常在**另一个插件的 Runner 里**抛出，只写进宿主日志；
+    2. 宿主 ``_cap_api_call`` 把它包成 ``{"success": False, "error": ...}``
+       正常返回，我们这边看不到「抛了」；
+    3. 如果下游的解析再认不出这个失败壳（我们之前就是），就会得出
+       「0 条消息、没有错误」，于是日志写「补抓 0 条，已到缓存尽头」——
+       一个越错越像正常的组合。
+    从 2026-11-06 上线到 11-07 才发现，就是这么攒出来的。
+
+    判据：**传参只能用 ``params=``，不许用 ``**`` 展开**。
+    ``**`` 展开在这套 API 下必错，不管展开的是不是 OneBot 参数。
+    """
+
+    import ast
+
+    offenders: list[str] = []
+    scanned = 0
+    for path in sorted(HERE.glob("*.py")):
+        if path.name.startswith(("tests", "real_sdk", "check_", "bench", "build_", "fix_")):
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            # 认 `xxx.api.call(...)` 与 `xxx.call(...)` 两种写法里带 api 的那种
+            if not isinstance(func, ast.Attribute) or func.attr != "call":
+                continue
+            owner = func.value
+            is_api = False
+            if isinstance(owner, ast.Attribute) and owner.attr == "api":
+                is_api = True
+            elif isinstance(owner, ast.Name) and "api" in owner.id.lower():
+                is_api = True
+            if not is_api:
+                continue
+            scanned += 1
+            for keyword in node.keywords:
+                if keyword.arg is None:
+                    offenders.append(f"{path.name}:{node.lineno} 用了 ** 展开")
+
+    check(scanned > 0, f"源码里扫到 {scanned} 处 api.call 调用")
+    check(
+        not offenders,
+        "**api.call 只用 params= 传参，不许 ** 展开**"
+        f"（适配器签名只接一个 params；问题项：{offenders}）",
+    )
+
+
 def _host_supported_item_types(source_root: Path) -> set[str]:
     """从宿主源码里抽出「快照 item_type 认哪些字符串」。
 
@@ -918,6 +979,9 @@ def main() -> int:
 
     print("[10] 用宿主真实反序列化器校验 planner 注入（可选）")
     _check_planner_items_with_host(instance)
+
+    print("[11] 适配器 API 的调用方式")
+    _check_api_call_style()
 
     print()
     if failures:

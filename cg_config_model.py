@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover - 仅用于脱离 Runner 的本地导入
 from .cg_person import DEFAULT_INTIMACY_LEVELS, DEFAULT_ROLES
 
 
-CONFIG_VERSION = "1.2.0"
+CONFIG_VERSION = "1.2.1"
 
 #: 本插件负责补全的五类情境记忆。顺序即注入时的展示顺序。
 ALL_CATEGORIES: tuple[str, ...] = (

@@ -5267,12 +5267,15 @@ def test_initiative() -> None:
     check("interest=" in described_hit, "命中兴趣时描述里要有 interest 那一项")
 
 
-def test_backfill() -> None:
+async def test_backfill() -> None:
     """历史补抓：把「她没看见的那几天」从 QQ 端捞回来。
 
     三个坑都是真机撞出来的（NapCat 文档写错的地方）：锚点是 ``message_id``
     不是 ``message_seq``；``count`` 上限 200 且会被内部裁剪；**空数组不等于
     不可用**（用户原话「私聊应该不是拿不到，而是这几天并没有私聊」）。
+
+    第四个坑是 2026-11-07 才发现的（``async`` 就是为它改的——要真调一次
+    才能验调用风格）：``ctx.api.call`` 的参数必须裹在 ``params=`` 里。
     """
 
     print("[16] 历史补抓")
@@ -5297,6 +5300,36 @@ def test_backfill() -> None:
     check(
         backfill_mod._unwrap_history(None)[1] != "",
         "None 响应报错",
+    )
+
+    # ── 宿主 RPC 的失败壳必须报错，不能当「到底了」 ──
+    #
+    # 2026-11-07 真机：`ctx.api.call` 的参数传法写错（把 params 展开成
+    # 关键字参数），适配器每次都抛 `unexpected keyword argument 'user_id'`，
+    # 宿主包成 `{"success": False, "error": ...}` 返回。当时这里认不出这个壳，
+    # 落到最后 `return [], ""` —— 也就是「0 条消息、没有错误」，补抓循环
+    # 于是认为「到底了」，日志打「补抓 0 条，已到缓存尽头」。
+    # **一句谎话，而且盖住了真错误**，害得「补抓从来没成功过」拖了两天。
+    rpc_fail_rows, rpc_fail_error = backfill_mod._unwrap_history(
+        {"success": False, "error": "unexpected keyword argument 'user_id'"}
+    )
+    check(rpc_fail_rows == [], "宿主失败壳里没有消息")
+    check(rpc_fail_error != "", "**宿主失败壳必须报错**，不能当成「没有消息」")
+    check(
+        "user_id" in rpc_fail_error,
+        "错误信息要带上底层原因，否则查不出是参数传错",
+    )
+    check(
+        backfill_mod._unwrap_history({"success": False})[1] != "",
+        "失败壳没有 error 字段时也要报错",
+    )
+    ok_rows, ok_error = backfill_mod._unwrap_history(
+        {"success": True, "result": {"status": "ok", "retcode": 0,
+                                     "data": {"messages": [{"message_id": 7}]}}}
+    )
+    check(
+        len(ok_rows) == 1 and ok_error == "",
+        "成功壳要剥掉 result 继续往下认",
     )
 
     # ── OneBot → 插件消息转换 ──
@@ -5401,7 +5434,120 @@ def test_backfill() -> None:
     check("5" in desc, "描述里带条数")
     check("尽头" in desc or "到头" in desc, "翻到缓存尽头要说出来")
 
-    # 反向断言：这些数字是实测出来的，改小会漏消息、改大会撑爆提示词
+    # ── 调用风格：参数必须裹在 params= 里 ──
+    #
+    # 2026-11-07 真机报 `got an unexpected keyword argument 'user_id'`：
+    # 适配器签名是 `async def api_action_get_friend_msg_history(self, params=None)`,
+    # **只接一个 params**。而 `ctx.api.call(name, **params)` 会把 user_id /
+    # group_id 当独立关键字递过去，直接 TypeError。
+    #
+    # 这个 bug 能活这么久，一半靠 `_unwrap_history` 把错误吞成「0 条」，
+    # 另一半靠这里**根本没有调用风格的断言**。补上。
+    calls: list[dict[str, Any]] = []
+
+    class _FakeApiProxy:
+        async def call(self, api_name: str, **kwargs: Any) -> Any:
+            calls.append({"api_name": api_name, **kwargs})
+            return {"status": "ok", "retcode": 0, "data": {"messages": []}}
+
+    class _FakeCtx:
+        api = _FakeApiProxy()
+
+    await backfill_mod.fetch_group_history(
+        _FakeCtx(), group_id="999", session_id="s1", group_name="测试群"
+    )
+    check(len(calls) == 1, "群历史走了一次适配器调用")
+    call = calls[0]
+    check(
+        set(call) == {"api_name", "version", "params"},
+        f"**参数裹在 params= 里，不展开成关键字参数**（实际键: {sorted(call)}）",
+    )
+    check(isinstance(call["params"], dict), "params 是字典")
+    check(call["version"] == "1", "带版本号 1")
+    group_params = call["params"]
+    check(group_params.get("group_id") == "999", "群号进去了")
+    check(group_params.get("reverse_order") is True, "reverse_order 进去了")
+    check(
+        not any(str(key).startswith("_") for key in group_params),
+        "**我们自己记账的 _session_id 之类不能发给对端**",
+    )
+    check(
+        "platform" not in group_params,
+        "platform 是记账字段，不该出现在 OneBot 参数里",
+    )
+
+    calls.clear()
+    await backfill_mod.fetch_friend_history(_FakeCtx(), user_id="10001", session_id="s2")
+    friend_params = calls[0]["params"]
+    check(friend_params.get("user_id") == "10001", "私聊把 user_id 放进去")
+    check(
+        "group_id" not in friend_params,
+        "私聊不带 group_id",
+    )
+
+    # 分页锚点：第二页要把上一页第一条的 message_id 递回去
+    calls.clear()
+
+    class _PagingApiProxy:
+        async def call(self, api_name: str, **kwargs: Any) -> Any:
+            params = kwargs.get("params") or {}
+            calls.append(params)
+            if "message_id" not in params:
+                return {
+                    "status": "ok",
+                    "retcode": 0,
+                    "data": {
+                        "messages": [
+                            {"message_id": 100, "time": 1_800_000_000, "user_id": "1",
+                             "sender": {"user_id": "1", "nickname": "甲"},
+                             "group_id": "999", "message": [{"type": "text", "data": {"text": "a"}}]},
+                            {"message_id": 101, "time": 1_800_000_060, "user_id": "1",
+                             "sender": {"user_id": "1", "nickname": "甲"},
+                             "group_id": "999", "message": [{"type": "text", "data": {"text": "b"}}]},
+                        ]
+                    },
+                }
+            return {"status": "ok", "retcode": 0, "data": {"messages": []}}
+
+    class _PagingCtx:
+        api = _PagingApiProxy()
+
+    await backfill_mod.fetch_group_history(_PagingCtx(), group_id="999", session_id="s3")
+    check(len(calls) >= 2, "翻到第二页")
+    check(
+        calls[1].get("message_id") == 100,
+        "**第二页的锚点是上一页第一条的 message_id**（不是 message_seq）",
+    )
+
+    # ── 端到端：适配器报错时必须报错，**不能说成「已到缓存尽头」** ──
+    #
+    # 这条是这次真实事故的回归。宿主把异常包成
+    # `{"success": False, "error": ...}` 交回来，如果我们认不出这个壳，
+    # 就会得到「0 条、无错误」，`fetch_history` 于是一路顺拐到
+    # `reached_start = True`，日志写「补抓 0 条，已到缓存尽头」。
+    # 修完之后：error 非空、reached_start 必须是 False。
+    class _FailingApiProxy:
+        async def call(self, api_name: str, **kwargs: Any) -> Any:
+            return {"success": False, "error": "unexpected keyword argument 'user_id'"}
+
+    class _FailingCtx:
+        api = _FailingApiProxy()
+
+    failed = await backfill_mod.fetch_group_history(
+        _FailingCtx(), group_id="999", session_id="s4"
+    )
+    check(not failed.ok, "适配器报错时 BackfillResult 必须是失败")
+    check(failed.error != "", "失败要有错误信息")
+    check(
+        not failed.reached_start,
+        "**调用失败绝不能说成「已到缓存尽头」**（这次事故的直接原因）",
+    )
+    check(
+        "已到缓存尽头" not in backfill_mod.describe_result(failed),
+        "描述里不能出现「已到缓存尽头」（会把真错误盖掉）",
+    )
+
+    # ── 反向断言：这些数字是实测出来的，改小会漏消息、改大会撑爆提示词 ──
     check(backfill_mod.PAGE_SIZE <= 200, "每页条数不超过适配器硬上限 200")
     check(backfill_mod.MAX_AGE_DAYS <= 15, "最多补的天数不超过适配器缓存深度")
 
@@ -5681,7 +5827,7 @@ async def main() -> None:
         test_boundary()
         test_presence()
         test_initiative()
-        test_backfill()
+        await test_backfill()
         test_history()
         test_guard()
         await test_energy_gate(tmp)
