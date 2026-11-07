@@ -28,6 +28,7 @@ import os
 import time
 import uuid
 from datetime import datetime
+from time import perf_counter
 from typing import Any
 
 try:  # 正常安装环境
@@ -96,6 +97,7 @@ from .cg_history import (
 )
 from .cg_initiative import (
     Decision,
+    REASON_MUTED,
     describe as describe_initiative,
     evaluate as evaluate_initiative,
     filter_tools,
@@ -140,8 +142,29 @@ PLUGIN_ID = "github.TommyAAKK.maibot-I-deepseek"
 DB_FILENAME = "companion_gap.db"
 
 #: 注入 hook 的超时预算。宿主给这个 hook 的默认预算是 6000ms，
-#: 这里主动收紧到 2500ms：宁可这次不注入，也不要拖慢回复。
-INJECT_TIMEOUT_MS = 2500
+#: 这里收紧到 4000ms：既保留「宁可这次不注入，也不要拖慢回复」的本意，
+#: 又给串行链留出余量。
+#:
+#: 为什么从 2500 提到 4000：本机 8 个插件都挂在 ``maisaka.planner.before_request``
+#: 上，宿主是**串行**逐个 await 的，每个插件的超时预算各自独立但总耗时叠加。
+#: 2500ms 是最紧的一环，一旦那台机器慢一点就会连续超时——连续 3 次之后宿主
+#: 熔断 60~300 秒（``circuit_breaker._FAILURE_THRESHOLD = 3``），熔断期间整个
+#: 插件在这个 hook 上静默跳过，表现和「闸门把她永久静音了」一模一样。
+INJECT_TIMEOUT_MS = 4000
+
+#: 单次闸门判定的耗时告警线。超过就记一条 warning —— 别等熔断了才发现慢。
+_GATE_SLOW_MS = 800.0
+
+#: 宿主 planner 快照里「系统消息」这个 item 的类型名。
+#:
+#: **不是 ``"system"``。** 宿主 ``serialize_context_item_snapshot()`` 用
+#: ``item.__class__.__name__`` 当 ``item_type``，反序列化时按类名精确匹配
+#: ``"SystemMessageItem"``，认不出就抛
+#: ``不支持的 Context Item 快照类型: system``，然后整个 items 被丢弃、
+#: 只留一行 warning。也就是说写 ``"system"`` 的那一版**从来没注入进去过**。
+#: 历史上我们一直写 ``"system"``，直到翻宿主日志才看见
+#: ``Hook maisaka.planner.before_request 返回的 items 无效，已忽略``。
+_SYSTEM_ITEM_TYPES = ("SystemMessageItem", "system")
 
 #: 观察 hook 的超时预算。mark_dirty 只改内存，1000ms 足够。
 CAPTURE_TIMEOUT_MS = 1000
@@ -167,8 +190,8 @@ _REPLY_KW: dict[str, Any] = {
     "timeout_ms": CAPTURE_TIMEOUT_MS,
     "description": "记录 Bot 刚发出的回复，用于更新自身情绪",
 }
-#: planner 侧的状态注入。宿主这个 hook 默认预算是 6000ms，同样收紧到
-#: 2500ms：它只读内存与本地 SQLite，没有任何网络调用。
+#: planner 侧的状态注入。宿主这个 hook 默认预算也是 6000ms；它只读内存与
+#: 本地 SQLite，没有任何网络调用，所以和 inject 用同一个收紧值。
 _PLANNER_KW: dict[str, Any] = {
     "name": "inject_planner_state",
     "timeout_ms": INJECT_TIMEOUT_MS,
@@ -278,6 +301,16 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         self._online_windows_at: float = 0.0
         self._online_stop = asyncio.Event()
         self._online_task: asyncio.Task[Any] | None = None
+        # 自主发言闸门的进程级静音窗截止时刻（epoch 秒）。
+        #
+        # focus 模式下判了「这轮不说」，模型可以改用 switch_chat 切到别的会话，
+        # 而切过去会开**新的一轮**、闸门在干净上下文里重新判——于是「不在这说」
+        # 变成了「去别处说」。窗口是进程级的，不按 session 记：换到哪个会话都算。
+        self._mute_until: float = 0.0
+        # 闸门连续超时的次数。宿主熔断器的阈值是 3 次，我们没有能力直接读熔断
+        # 状态（不在那 75 项能力清单里），所以自己数——数到这里就等于「下一枪
+        # 打完这个 hook 会被静默跳过」。
+        self._gate_slow_streak: int = 0
 
     # ── 配置 ──
 
@@ -604,7 +637,7 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
 
         appended = False
         for item in reversed(items):
-            if isinstance(item, dict) and item.get("item_type") == "system":
+            if isinstance(item, dict) and item.get("item_type") == "SystemMessageItem":
                 parts = item.get("parts")
                 if not isinstance(parts, list):
                     parts = []
@@ -616,7 +649,7 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
             items.insert(
                 0,
                 {
-                    "item_type": "system",
+                    "item_type": "SystemMessageItem",
                     "meta": {
                         "item_id": f"companion-gap-boundary-{uuid.uuid4().hex}",
                         "logical_turn_id": None,
@@ -637,11 +670,18 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         看到啥都要回。插件没有能力 abort 一轮发言，只能把工具收走——模型
         不是「被劝别说」，是**没有说的手段**。
 
-        判定顺序（硬过滤在前，软评分在后）：开关 → @/提及 → 能耗尽 →
-        边界感 → 软评分。每次判定都写日志，因为主动功能最难排查的就是
-        「它为什么不说话」。
+        判定顺序（硬过滤在前，软评分在后）：开关 → @/提及 → 静音窗 →
+        能耗尽 → 边界感 → 软评分。每次判定都写日志，因为主动功能最难排查的
+        就是「它为什么不说话」。
+
+        **静音窗（``initiative.mute_seconds``）解决的是 focus 模式下的漏网。**
+        ``switch_chat`` 切到别的会话时会 ``_queue_proactive_turn`` 开**新的一轮**，
+        闸门在干净的上下文里重新判一次——于是一句「这轮不在这儿说」就变成了
+        「去别处说」。静音窗是进程级的：判了 deny 之后的一小段时间里，换到
+        哪个会话都不开口。@ 仍然穿透这个窗口。
         """
 
+        started = perf_counter()
         out_kwargs = dict(out)
         cfg = self.config
         initiative_cfg = getattr(cfg, "initiative", None)
@@ -677,16 +717,15 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         except Exception as exc:  # noqa: BLE001 - 判不出来就不拦
             self._debug(f"边界感沉默判定失败（按未沉默处理）: {exc!r}")
 
-        # 心情与关系：给软评分用。
+        # 心情与关系：给软评分用。精力不再参与打分（见 cg_initiative 的说明），
+        # 但仍然作为硬闸的输入由上面 exhausted 承担。
         valence = 0.0
         arousal = 0.5
-        energy = 1.0
         try:
             if self._mood is not None:
                 snapshot = self._mood.snapshot()
                 valence = float(getattr(snapshot, "valence", 0.0) or 0.0)
                 arousal = float(getattr(snapshot, "arousal", 0.5) or 0.5)
-                energy = float(getattr(snapshot, "energy", 1.0) or 1.0)
         except Exception as exc:  # noqa: BLE001
             self._debug(f"读取情绪快照失败（用中性值）: {exc!r}")
 
@@ -707,12 +746,16 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         text = self._planner_user_text(kwargs)
         likes = self._liked_topics(store)
 
+        now = time.time()
+        muted = now < self._mute_until
+
         decision: Decision = evaluate_initiative(
             enabled=True,
             at_pending=at_pending,
             mentioned_pending=mentioned_pending,
             at_always_reply=bool(getattr(initiative_cfg, "at_always_reply", True)),
             mentioned_always_reply=bool(getattr(initiative_cfg, "mentioned_always_reply", False)),
+            muted=muted,
             exhausted=exhausted,
             boundary_silent=boundary_silent,
             text=text,
@@ -720,13 +763,34 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
             affection=affection,
             valence=valence,
             arousal=arousal,
-            energy=energy,
             threshold=float(getattr(initiative_cfg, "threshold", 0.45) or 0.45),
         )
+
+        # 判了不说 → 开静音窗。
+        #
+        # 这里必须用「最终是否允许开口」，而不是「是不是被软评分拒的」——
+        # 能耗尽、边界感这些硬闸同样得让窗口生效，否则下一轮换个会话又会
+        # 重新判一次，一样漏。
+        #
+        # 但**已经在窗内时不再续窗**：否则每一轮 planner 都会把截止时间往后推
+        # 30 秒，只要她一直在被消息唤醒，窗口就永远关不上——从「这轮不说」
+        # 变成「永久静音」，和原来那个 bug 是同一个形状。
+        if not decision.allow and decision.reason != REASON_MUTED:
+            seconds = max(0.0, float(getattr(initiative_cfg, "mute_seconds", 30.0) or 0.0))
+            if seconds > 0.0:
+                self._mute_until = max(self._mute_until, now + seconds)
 
         drop: tuple[str, ...] = ("reply",)
         if bool(getattr(initiative_cfg, "gate_send_emoji", True)):
             drop = ("reply", "send_emoji")
+        # 静音窗内是否连「换台」也收回。默认关——拿掉 reply 就够拦住「说出来」，
+        # 把 switch_chat 一起拿走会让她连「去看看别的群」都做不到，focus 就该废了。
+        #
+        # 这里用「窗口还没过期」而不是本轮进来时的 ``muted``：判完不说的这一轮
+        # 刚刚把窗口打开，如果按 ``muted`` 判，这一轮就漏掉了——而恰恰是这一轮
+        # 模型最可能顺手 switch_chat 换个地方说。
+        if self._mute_until > now and bool(getattr(initiative_cfg, "gate_switch_chat", False)):
+            drop = tuple(drop) + ("switch_chat",)
 
         kept, removed = filter_tools(
             kwargs.get("tool_definitions"),
@@ -735,11 +799,38 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         )
         if bool(getattr(initiative_cfg, "log_decisions", True)):
             tail = f"；已收回 {', '.join(removed)}" if removed else ""
-            self._debug(f"自主发言：{describe_initiative(decision)}（{who}）{tail}")
+            window = ""
+            if self._mute_until > now:
+                window = f"；静音窗剩 {self._mute_until - now:.0f}s"
+            self._debug(f"自主发言：{describe_initiative(decision)}（{who}）{tail}{window}")
         if kept is None:
             # 工具清单形态不认识 —— **看不懂就别改**，这比猜测性地清空安全得多。
             return out_kwargs
         out_kwargs["tool_definitions"] = kept
+
+        # 熔断保护：这个 hook 的超时预算是最紧的一环（宿主给 6000ms，我们自己的
+        # _PLANNER_KW 只给 4000ms），连续超时 3 次会被宿主熔断 60~300 秒，熔断
+        # 期间整个插件在这个 hook 上静默跳过——表现和「闸门把她永久静音了」
+        # 一模一样，但根因完全不同。超过 800ms 就提前记一条 warning，别等熔断。
+        #
+        # 宿主没有把熔断状态暴露成能力（``get_plugin_circuit_statuses`` 挂在
+        # integration 对象上，不在 75 项能力清单里），所以这里只能自己数：
+        # 连续 3 次慢就是熔断器的 ``_FAILURE_THRESHOLD``，到点必须喊一声。
+        cost_ms = (perf_counter() - started) * 1000.0
+        if cost_ms > _GATE_SLOW_MS:
+            self._gate_slow_streak += 1
+            self._warn(
+                f"自主发言闸门耗时 {cost_ms:.0f}ms（阈值 {_GATE_SLOW_MS:.0f}ms，"
+                f"连续 {self._gate_slow_streak} 次），持续超时会被宿主熔断"
+            )
+            if self._gate_slow_streak >= 3:
+                self._warn(
+                    "闸门已连续 3 次超过 800ms，宿主熔断器阈值就是 3——"
+                    "再超一次这个 hook 会被静默跳过 60~300 秒，"
+                    "那段时间她完全不受闸门管（不是被静音，是闸门没跑）"
+                )
+        else:
+            self._gate_slow_streak = 0
         return out_kwargs
 
     @staticmethod
@@ -753,7 +844,7 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         for item in reversed(items):
             if not isinstance(item, dict):
                 continue
-            if str(item.get("item_type") or "") == "system":
+            if str(item.get("item_type") or "") in _SYSTEM_ITEM_TYPES:
                 continue
             parts = item.get("parts")
             if not isinstance(parts, list):

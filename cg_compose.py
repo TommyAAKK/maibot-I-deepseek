@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 from typing import Any, Iterable, Mapping, Sequence
 
+from .cg_guard import is_clean
 from .cg_store import recall_score
 
 #: 类别的展示顺序与标题。顺序即重要性递减。
@@ -325,6 +326,11 @@ def compose_block(
         content = _clean(row.get("content"))
         if not content:
             continue
+        # 脏文本防御：别的插件会往消息的 processed_plain_text 里追加说明文字
+        # （真机出现过 meme-insight 的「[热梗：67] 怎么用/怎么接：…」），
+        # 抽取时被当成聊天内容记了下来。这类条目一旦注入，模型会照着复述。
+        if not is_clean(content):
+            continue
         grouped.setdefault(category, []).append(row)
 
     if not grouped:
@@ -490,6 +496,9 @@ def compose_cross_session_block(
         if not name:
             name = source_sid[:8] or "别处"
         chat_type = str(row.get("source_chat_type") or "").strip()
+        # 脏文本防御，同 compose_block。
+        if not is_clean(content):
+            continue
         cleaned.append((row, name, chat_type))
 
     if not cleaned:
@@ -568,7 +577,8 @@ def compose_recalled_block(
     cleaned: list[tuple[Mapping[str, Any], str]] = []
     for row in items:
         content = _clean(row.get("content"))
-        if content:
+        # 脏文本防御，同 compose_block。
+        if content and is_clean(content):
             cleaned.append((row, content))
     if not cleaned:
         return "", []

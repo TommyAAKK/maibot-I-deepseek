@@ -306,6 +306,231 @@ def _check_capability_usage_declared() -> None:
     check(not unused, f"manifest 没有声明用不到的能力（多出来的：{unused}）")
 
 
+def _host_supported_item_types(source_root: Path) -> set[str]:
+    """从宿主源码里抽出「快照 item_type 认哪些字符串」。
+
+    走静态解析而不是 ``import``：宿主那几个模块一导入就会连带启动
+    配置加载、数据库迁移、表情包管理器，在插件自检里做这种事既慢又有副作用
+    （实测还会因为真机库版本比源码新而直接抛
+    ``DatabaseMigrationExecutionError``）。而我们要的信息只是几条
+    ``if item_type == "XXX":`` 字面量，``ast`` 足够。
+    """
+
+    import ast
+
+    target = source_root / "src" / "llm_models" / "request_snapshot.py"
+    if not target.is_file():
+        return set()
+    try:
+        tree = ast.parse(target.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return set()
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not isinstance(node.left, ast.Name) or node.left.id != "item_type":
+            continue
+        for op, comparator in zip(node.ops, node.comparators):
+            if isinstance(op, ast.Eq) and isinstance(comparator, ast.Constant):
+                if isinstance(comparator.value, str) and comparator.value:
+                    found.add(comparator.value)
+    return found
+
+
+def _check_planner_items_with_host(instance) -> None:
+    """用宿主源码里的真实类型约束校验 planner 注入的 items。
+
+    这条防的是**又一处「写了但从没生效」**。宿主
+    ``serialize_context_item_snapshot()`` 用 ``item.__class__.__name__`` 当
+    ``item_type``（``"SystemMessageItem"``），反序列化时按类名精确匹配；
+    认不出就抛 ``不支持的 Context Item 快照类型: xxx``，
+    ``chat_loop_service`` 捕获后**整批 items 丢弃**，只留一行
+    ``Hook maisaka.planner.before_request 返回的 items 无效，已忽略``。
+
+    我们一直写 ``"system"``，于是 planner 侧的状态提示从写下那天起就没进过
+    一次请求——单元测试全过，因为它只检查自己拼的字典。
+
+    这里不 ``import`` 宿主（会连带起数据库/配置/表情包管理器），而是静态
+    抽出宿主认的 item_type 白名单，再把插件改写后的 items 逐个字段按宿主
+    ``_deserialize_item_meta`` 的规则验一遍。
+    """
+
+    source_root = Path(os.environ.get("CGAP_HOST_ROOT") or (HERE.parent / ".tmp" / "maibot-src"))
+    if not source_root.is_dir():
+        print("  跳过：没找到宿主源码目录")
+        return
+
+    supported = _host_supported_item_types(source_root)
+    if not supported:
+        print("  跳过：宿主 request_snapshot.py 里没解析出 item_type 白名单")
+        return
+    check(
+        "SystemMessageItem" in supported,
+        f"宿主认 SystemMessageItem 这个类型名（白名单 {len(supported)} 项）",
+    )
+
+    import asyncio
+    from datetime import datetime as _dt
+
+    # 按宿主的快照格式造载荷（字段名与 serialize_context_item_snapshot 一致）。
+    serialized = [
+        {
+            "item_type": "SystemMessageItem",
+            "meta": {
+                "item_id": "real-sdk-system",
+                "logical_turn_id": None,
+                "timestamp": _dt.now().astimezone().isoformat(),
+            },
+            "parts": [{"type": "text", "text": "原有系统提示"}],
+        },
+        {
+            "item_type": "UserMessageItem",
+            "meta": {
+                "item_id": "real-sdk-user",
+                "logical_turn_id": None,
+                "timestamp": _dt.now().astimezone().isoformat(),
+            },
+            "parts": [{"type": "text", "text": "今天天气怎么样"}],
+        },
+    ]
+
+    kwargs = {
+        "session_id": "qq:group:real-sdk-check",
+        "items": serialized,
+        "item_schema_version": 1,
+        "tool_definitions": [],
+        "reply_reason": "被使唤来使唤去",
+    }
+
+    # 打开边界感注入，逼出「往 items 里写东西」那条路径。
+    try:
+        base = instance.config
+        instance._config_fallback = base.model_copy(
+            update={
+                "boundary": base.boundary.model_copy(
+                    update={"enabled": True, "note_enabled": True, "note_to_planner": True}
+                )
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  跳过：调整配置失败（{type(exc).__name__}: {exc}）")
+        return
+
+    # 边界感渲染依赖 ``_store`` / ``_mood``，它们只有 ``on_load`` 之后才有值。
+    # 自检里不启动插件（会真连数据库、真起后台任务），所以给两个最小替身：
+    # 注入路径要读的东西不多，桩够用就行，重点是让「往 items 里写东西」
+    # 这条分支真的被执行到。
+    class _StubStore:
+        def get_state(self, session_id: str) -> dict:
+            return {"platform": "qq", "user_id": "10000001", "chat_type": "group"}
+
+        def get_person(self, key: str):
+            return None
+
+        def list_prefs(self, **kwargs: Any):
+            return []
+
+    class _StubSnapshot:
+        valence = 0.2
+        anger = 0.0
+        label = "平静"
+
+    class _StubMood:
+        def snapshot(self, **kwargs: Any):
+            return _StubSnapshot()
+
+        def can_initiate(self, **kwargs: Any) -> bool:
+            return True
+
+    class _StubLogger:
+        def debug(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def info(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def warning(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def error(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    class _StubCtx:
+        logger = _StubLogger()
+
+    instance._store = _StubStore()
+    instance._mood = _StubMood()
+    # ``_debug`` / ``_warn`` 走 ``self.ctx.logger``，没有 ctx 会抛
+    # 「插件上下文尚未初始化」——注入路径里没有 try 包住日志，所以桩必须给上。
+    instance._ctx = _StubCtx()
+
+    try:
+        result = asyncio.run(instance.inject_planner_state(**kwargs))
+    except Exception as exc:  # noqa: BLE001
+        check(False, f"inject_planner_state 可调用（{type(exc).__name__}: {exc}）")
+        return
+
+    modified = (result.get("modified_kwargs") or {}).get("items")
+    check(isinstance(modified, list) and bool(modified), "inject_planner_state 返回了 items")
+    if not isinstance(modified, list) or not modified:
+        return
+    # 逐个 item 按宿主规则验：类型名在白名单里、meta 三件套合法。
+    bad_types: list[str] = []
+    bad_meta: list[str] = []
+    for index, item in enumerate(modified):
+        if not isinstance(item, dict):
+            bad_types.append(f"#{index} 不是字典")
+            continue
+        item_type = item.get("item_type")
+        if not isinstance(item_type, str) or item_type not in supported:
+            bad_types.append(f"#{index} {item_type!r}")
+            continue
+        meta = item.get("meta")
+        if not isinstance(meta, dict):
+            bad_meta.append(f"#{index} meta 不是字典")
+            continue
+        item_id = meta.get("item_id")
+        if not isinstance(item_id, str) or not item_id.strip():
+            bad_meta.append(f"#{index} item_id 非法")
+        if "logical_turn_id" not in meta:
+            bad_meta.append(f"#{index} 缺 logical_turn_id 键")
+        stamp = meta.get("timestamp")
+        if not isinstance(stamp, str) or not stamp.strip():
+            bad_meta.append(f"#{index} timestamp 非法")
+        else:
+            try:
+                _dt.fromisoformat(stamp)
+            except ValueError:
+                bad_meta.append(f"#{index} timestamp 不是合法 ISO")
+    check(not bad_types, f"插件写回的 item_type 都在宿主白名单里（问题项 {bad_types}）")
+    check(not bad_meta, f"插件写回的 meta 满足宿主协议（问题项 {bad_meta}）")
+
+    # item_id 必须唯一，否则宿主 validate_context_items 会抛「存在重复 item_id」。
+    ids = [
+        (item.get("meta") or {}).get("item_id")
+        for item in modified
+        if isinstance(item, dict) and isinstance(item.get("meta"), dict)
+    ]
+    check(len(ids) == len(set(ids)), f"item_id 互不重复（{len(ids)} 条）")
+
+    # 注入的文字必须真的落在某条 system 消息里。
+    joined = ""
+    for item in modified:
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("parts") or ():
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text")
+                if isinstance(text, str):
+                    joined += text + "\n"
+    check("原有系统提示" in joined, "原有系统提示仍在（没有被覆盖掉）")
+    check(
+        "此刻的你" in joined,
+        "边界感状态提示真的进了 items（宿主不会再整批丢弃）",
+    )
+
+
 def _check_webui_declaration(instance) -> None:
     """用宿主真实的 load_webui_extension 校验 webui.json，并交叉核对 API。
 
@@ -506,7 +731,22 @@ def main() -> int:
     check(hooks["inject_context"]["mode"] == HookMode.BLOCKING.value, "inject 是 BLOCKING")
     check(hooks["inject_context"]["order"] == HookOrder.LATE.value, "inject 是 LATE")
     check(hooks["inject_context"]["error_policy"] == ErrorPolicy.SKIP.value, "inject 是 SKIP")
-    check(hooks["inject_context"]["timeout_ms"] == 2500, "inject 超时 2500ms")
+    # 4000ms 而不是宿主的 6000ms：本机 8 个插件串行挂在同一个 planner hook
+    # 上，2500ms 曾是整条链最紧的一环，连续 3 次超时会被宿主熔断 60~300 秒
+    # （circuit_breaker._FAILURE_THRESHOLD = 3），熔断期间整个插件在这个 hook
+    # 上静默跳过——表现和「闸门把她永久静音」一模一样，但根因完全不同。
+    check(
+        hooks["inject_context"]["timeout_ms"] == plugin_mod.INJECT_TIMEOUT_MS,
+        "inject 超时与 INJECT_TIMEOUT_MS 一致",
+    )
+    check(
+        plugin_mod.INJECT_TIMEOUT_MS == 4000,
+        "inject 超时 4000ms（留出串行链余量，别撞熔断）",
+    )
+    check(
+        hooks["inject_planner_state"]["timeout_ms"] == plugin_mod.INJECT_TIMEOUT_MS,
+        "planner 注入与 inject 共用同一个超时预算",
+    )
     check(hooks["capture_message"]["mode"] == HookMode.OBSERVE.value, "capture 是 OBSERVE")
 
     cmd = next(i for i in infos if i["type"] == "COMMAND")
@@ -575,7 +815,7 @@ def main() -> int:
                 plain_labels.append(f"[{section_name}].{field_name}={label!r}")
             if not hint or not _has_cjk(hint):
                 plain_hints.append(f"[{section_name}].{field_name}={hint!r}")
-    check(field_total == 168, f"schema 共 168 个配置项（实际 {field_total}）")
+    check(field_total == 170, f"schema 共 170 个配置项（实际 {field_total}）")
     check(not plain_labels, f"每个配置项的 label 都是中文（问题项 {plain_labels}）")
     check(not plain_hints, f"每个配置项的 hint 都是中文（问题项 {plain_hints}）")
 
@@ -675,6 +915,9 @@ def main() -> int:
 
     print("[9] 源码用到的能力是否都写进了 manifest")
     _check_capability_usage_declared()
+
+    print("[10] 用宿主真实反序列化器校验 planner 注入（可选）")
+    _check_planner_items_with_host(instance)
 
     print()
     if failures:

@@ -68,10 +68,17 @@ from typing import Any, Iterable, Sequence
 GATED_TOOLS: tuple[str, ...] = ("reply", "send_emoji")
 
 #: 软评分的各项权重（加起来 1.0）。改这些会直接改变她的「话痨程度」。
+#:
+#: **精力刻意不在权重里。** 精力已经有自己的两道闸：``cg_mood.can_initiate()``
+#: 的硬过滤（耗尽直接闭嘴）和 ``cg_energy_gate`` 的宿主频率门控。软评分再给
+#: 它 0.10 权重就是同一个原因算两遍——市场调研里 life-frequency 的
+#: ``score_of()`` 明写着「刻意只用加性小偏置，不引入任何乘性权重」，理由是
+#: 「精力低」已经有一道 ``low_energy`` 硬闸了。
+#:
+#: 量纲上也不对：闸门管「能不能说」，软分该管「想不想说」。精力是前者。
 WEIGHT_INTEREST = 0.40
 WEIGHT_AFFECTION = 0.30
 WEIGHT_MOOD = 0.20
-WEIGHT_ENERGY = 0.10
 
 #: 软评分达到这个值才允许开口。0.45 是「三样里至少两样还行」的水平。
 DEFAULT_THRESHOLD = 0.45
@@ -79,9 +86,28 @@ DEFAULT_THRESHOLD = 0.45
 #: 好感度归一化的上限。超过这个值一律按满分算。
 AFFECTION_CEILING = 80.0
 
+#: 好感度的分档表 ``(下限, 归一值)``，从高到低匹配。
+#:
+#: **为什么不再用「好感 / 80」线性归一：** 真机 16 个人的好感度分布是长尾——
+#: 一个 owner 99、一个熟人 22.6，其余 14 个全贴在 0 附近（还有一个 -21.5）。
+#: 线性归一之后除 owner 外所有人都在 0.28 以下，等于「陌生人一律不许说话」。
+#: 但「陌生」不等于「不想跟他说话」，它是中性值，不该被当成最低分。
+#:
+#: 分档的语义：负分是反感（真的不想理），0~20 是陌生人（中性），越往上越亲近。
+AFFECTION_TIERS: tuple[tuple[float, float], ...] = (
+    (80.0, 1.00),
+    (60.0, 0.90),
+    (40.0, 0.70),
+    (20.0, 0.50),
+    (0.0, 0.30),
+)
+#: 好感度为负时的归一值——低于这个就是明确的「不想理」。
+AFFECTION_HOSTILE = 0.0
+
 #: 被 @ 时的原因标签，写进日志用。
 REASON_AT = "被@"
 REASON_MENTIONED = "被提及"
+REASON_MUTED = "静音窗内"
 REASON_EXHAUSTED = "能耗尽"
 REASON_BOUNDARY = "边界感不想接话"
 REASON_DISABLED = "闸门未启用"
@@ -158,10 +184,25 @@ def interest_score(text: str, *, likes: Iterable[str]) -> float:
 
 
 def affection_score(affection: float, *, ceiling: float = AFFECTION_CEILING) -> float:
-    """好感度归一化到 0~1。"""
+    """好感度分档归一化到 0~1。
 
+    分档而不是线性除法，理由见 :data:`AFFECTION_TIERS`：真机分布是长尾，
+    线性归一等于把「陌生」判成「几乎不想理」。这里让「陌生」落在中性的
+    0.30，负分才归零。
+
+    ``ceiling`` 只用来兜底：好感度超过它一律按满分。
+    """
+
+    value = _as_float(affection)
+    if value < 0.0:
+        return AFFECTION_HOSTILE
     limit = max(1.0, float(ceiling))
-    return _clamp01(_as_float(affection) / limit)
+    if value >= limit:
+        return 1.0
+    for floor, score in AFFECTION_TIERS:
+        if value >= floor:
+            return _clamp01(score)
+    return AFFECTION_HOSTILE
 
 
 def mood_score(*, valence: float, arousal: float = 0.5) -> float:
@@ -182,6 +223,7 @@ def evaluate(
     mentioned_pending: bool = False,
     at_always_reply: bool = True,
     mentioned_always_reply: bool = False,
+    muted: bool = False,
     exhausted: bool = False,
     boundary_silent: bool = False,
     text: str = "",
@@ -194,7 +236,7 @@ def evaluate(
 ) -> Decision:
     """闸门主判定。
 
-    顺序：开关 → @/提及 → 能耗尽 → 边界感 → 软评分。
+    顺序：开关 → @/提及 → 静音窗 → 能耗尽 → 边界感 → 软评分。
 
     Args:
         enabled: 闸门总开关，关掉时恒放行（退回宿主行为）。
@@ -205,11 +247,17 @@ def evaluate(
             ``mentioned_bot_reply``）。**和 @ 分开**：宿主本来就是两个独立开关，
             而且现实里「@ 我」和「顺口提到我名字」的强度差很远——前者是叫我，
             后者可能只是提到。
+        muted: 是否还处在上一轮判 deny 之后的静音窗内。focus 模式下
+            ``switch_chat`` 会开新的一轮新会话，闸门会在干净的上下文里重新判，
+            于是一句「不在这说」就变成了「去别处说」。静音窗是进程级的，
+            换到哪个会话都算。
         exhausted: 精力是否耗尽。
         boundary_silent: 边界感是否判「不想接话」。
         text: 当前这轮要说的话（用来算兴趣匹配）。传空字符串就跳过兴趣项。
         likes: 她喜欢的词。
-        affection/valence/arousal/energy: 心情与关系输入。
+        affection/valence/arousal: 心情与关系输入。
+        energy: **保留形参但不再参与打分**——精力只走硬闸（``exhausted``）。
+            留着是为了调用方不用改签名，也方便以后真要调权重时接回来。
         threshold: 软评分门槛。
     """
 
@@ -223,11 +271,17 @@ def evaluate(
     if mentioned_pending and mentioned_always_reply:
         return Decision(allow=True, reason=REASON_MENTIONED, score=1.0)
 
-    # ── 硬过滤 2：能耗尽 ────────────────────────────────────────────
+    # ── 硬过滤 2：静音窗 ────────────────────────────────────────────
+    # 上一轮判了「不说」之后的一小段时间里，换到哪个会话都不开口。
+    # 检查顺序在 @ 之后：@ 永远优先，被叫到名字就该应声。
+    if muted:
+        return Decision(allow=False, reason=REASON_MUTED, hard=True)
+
+    # ── 硬过滤 3：能耗尽 ────────────────────────────────────────────
     if exhausted:
         return Decision(allow=False, reason=REASON_EXHAUSTED, hard=True)
 
-    # ── 硬过滤 3：边界感 ────────────────────────────────────────────
+    # ── 硬过滤 4：边界感 ────────────────────────────────────────────
     # 主动和边界感必须共用同一个闸门：一边注入「你现在不太想接话」，
     # 一边又允许她主动开口，等于自相矛盾。
     if boundary_silent:
@@ -238,10 +292,21 @@ def evaluate(
     total_weight = 0.0
     total = 0.0
 
+    # 兴趣**只有命中时才参与**。
+    #
+    # 原来的写法是「不管有没有命中都把 0.40 权重算进分母」，等于「这次聊的内容
+    # 不在她喜欢的 16 个话题里」被倒扣 0.40。群里正常聊天基本不会命中那些
+    # 具体话题，于是分数上限被压到 0.60（0.30+0.20+0.10），实际上只有 owner
+    # 过得去 0.45 的门槛——闸门在最该生效的场合变成了永久静音。
+    #
+    # 语义上「没聊到她喜欢的东西」是中性（不相关），不是负面。不相关就该让
+    # 好感和心情自己决定。
     if str(text or "").strip():
-        parts["interest"] = interest_score(text, likes=likes)
-        total += parts["interest"] * WEIGHT_INTEREST
-        total_weight += WEIGHT_INTEREST
+        hit = interest_score(text, likes=likes)
+        if hit > 0.0:
+            parts["interest"] = hit
+            total += hit * WEIGHT_INTEREST
+            total_weight += WEIGHT_INTEREST
 
     parts["affection"] = affection_score(affection)
     total += parts["affection"] * WEIGHT_AFFECTION
@@ -251,14 +316,10 @@ def evaluate(
     total += parts["mood"] * WEIGHT_MOOD
     total_weight += WEIGHT_MOOD
 
-    parts["energy"] = _clamp01(_as_float(energy, 1.0))
-    total += parts["energy"] * WEIGHT_ENERGY
-    total_weight += WEIGHT_ENERGY
-
     if total_weight <= 0:
         return Decision(allow=False, reason=REASON_NOTHING, hard=True)
 
-    # 归一化：没有 text 时 interest 项不参与，剩下的权重要重新拉到 1.0，
+    # 归一化：兴趣没命中/没有文本时不参与，剩下的权重要重新拉到 1.0，
     # 否则「没有话题」这个中性情况会被系统性压低分。
     score = _clamp01(total / total_weight)
     allow = score >= max(0.0, float(threshold))
@@ -333,6 +394,7 @@ def filter_tools(
 _REASON_TEXT = {
     REASON_AT: "被 @ 了，必回",
     REASON_MENTIONED: "被点名了，必回",
+    REASON_MUTED: "上一轮说了不说，现在还在静音窗里",
     REASON_EXHAUSTED: "精力耗尽，这轮不开口",
     REASON_BOUNDARY: "边界感判了不想接话，这轮不开口",
     REASON_DISABLED: "闸门未启用，交给宿主",

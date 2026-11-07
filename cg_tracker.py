@@ -30,6 +30,7 @@ from .cg_backfill import (
     should_backfill,
 )
 from .cg_extract import format_transcript, frame_self_lines, run_extraction
+from .cg_guard import system_text_reason
 from .cg_history import describe_span, split_window, summarize_hole, to_history_rows
 from .cg_person import (
     accumulate_impact,
@@ -1042,6 +1043,17 @@ class SessionTracker:
         now = time.time()
         written = 0
         for item in items:
+            # 脏文本防御：别的插件会往消息的 processed_plain_text 后面追加
+            # 说明文字（真机真出现过），抽取时会被当成聊天内容一起记下来。
+            # 入库前就挡掉——写进去之后再靠注入端过滤，等于让脏数据占着
+            # 显著度配额，还会被 WebUI 看到。
+            dirty = system_text_reason(getattr(item, "content", ""))
+            if dirty:
+                self._warn(
+                    f"丢弃疑似系统文本的条目（{dirty}，{item.category}）: "
+                    f"{str(getattr(item, 'content', ''))[:120]}"
+                )
+                continue
             expires_at = _expiry_for(item.category, retention, now)
             try:
                 self._store.upsert_item(

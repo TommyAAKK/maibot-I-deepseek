@@ -1951,7 +1951,7 @@ async def test_plugin(tmp: str) -> None:
     plan_kwargs = {
         "session_id": bd_sid,
         "items": [
-            {"item_type": "system", "meta": {"item_id": "s1", "logical_turn_id": None,
+            {"item_type": "SystemMessageItem", "meta": {"item_id": "s1", "logical_turn_id": None,
                                              "timestamp": "2026-01-01T00:00:00+08:00"},
              "parts": [{"type": "text", "text": "原有系统提示"}]},
         ],
@@ -1972,6 +1972,44 @@ async def test_plugin(tmp: str) -> None:
     check("此刻的你" in plan_on_text, "打开后状态提示进 planner")
     check(len(plan_on_items) == 1, "复用了已有的 system item，没有额外新建")
     check("原有系统提示" in plan_on_text, "原有系统提示仍在同一条 item 里")
+    # item_type 必须是宿主认的类名。历史 bug：我们一直写 "system"，宿主
+    # deserialize_context_item_snapshot() 按类名精确匹配，认不出就抛
+    # 「不支持的 Context Item 快照类型: system」，然后**整批 items 被丢弃**，
+    # 只在宿主日志里留一行 warning。也就是说这条注入从写下那天起就没生效过。
+    check(
+        plan_on_items[0].get("item_type") == "SystemMessageItem",
+        "planner item 的 item_type 用宿主类名 SystemMessageItem（不是 system）",
+    )
+    _set_boundary(note_to_planner=False)
+
+    # 没有现成 system item 时要自己建一条，类型同样必须是类名。
+    _set_boundary(note_to_planner=True)
+    only_user_kwargs = {
+        "session_id": bd_sid,
+        "items": [
+            {"item_type": "UserMessageItem", "meta": {"item_id": "u1", "logical_turn_id": None,
+                                                      "timestamp": "2026-01-01T00:00:00+08:00"},
+             "parts": [{"type": "text", "text": "只有用户消息"}]},
+        ],
+        "item_schema_version": 1,
+        "reply_reason": "被使唤来使唤去",
+    }
+    built_res = await plugin.inject_planner_state(**only_user_kwargs)
+    built_items = (built_res.get("modified_kwargs") or {}).get("items") or []
+    check(len(built_items) == 2, "没有 system item 时新建一条")
+    check(
+        built_items[0].get("item_type") == "SystemMessageItem",
+        "新建的 item 用宿主类名 SystemMessageItem",
+    )
+    check(
+        isinstance((built_items[0].get("meta") or {}).get("item_id"), str)
+        and (built_items[0].get("meta") or {}).get("item_id"),
+        "新建的 item 有非空 item_id（宿主协议要求）",
+    )
+    check(
+        "logical_turn_id" in (built_items[0].get("meta") or {}),
+        "新建的 meta 里带 logical_turn_id（宿主协议要求这个键存在，可为 null）",
+    )
     _set_boundary(note_to_planner=False)
 
     # silence_level 必须真的改变注入文本（端到端）。
@@ -2017,10 +2055,10 @@ async def test_plugin(tmp: str) -> None:
     # 「这一轮到底开不开口」。宿主不给 abort 权限，所以手段是从工具清单里
     # 把 reply 收走 —— 模型不是被劝别说，是没有说的手段。
     _gate_items = [
-        {"item_type": "system", "meta": {"item_id": "g1", "logical_turn_id": None,
+        {"item_type": "SystemMessageItem", "meta": {"item_id": "g1", "logical_turn_id": None,
                                          "timestamp": "2026-01-01T00:00:00+08:00"},
          "parts": [{"type": "text", "text": "原有系统提示"}]},
-        {"item_type": "user", "meta": {"item_id": "g2", "logical_turn_id": None,
+        {"item_type": "UserMessageItem", "meta": {"item_id": "g2", "logical_turn_id": None,
                                        "timestamp": "2026-01-01T00:00:01+08:00"},
          "parts": [{"type": "text", "text": "今天天气怎么样"}]},
     ]
@@ -2028,6 +2066,8 @@ async def test_plugin(tmp: str) -> None:
         {"type": "function", "function": {"name": "reply", "description": "回复",
                                           "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "send_emoji", "description": "发表情",
+                                          "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "switch_chat", "description": "换台",
                                           "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "query_memory", "description": "查记忆",
                                           "parameters": {"type": "object", "properties": {}}}},
@@ -2041,7 +2081,7 @@ async def test_plugin(tmp: str) -> None:
     _gate_off_tools = (_gate_off.get("modified_kwargs") or {}).get("tool_definitions")
     check(
         [d["function"]["name"] for d in _gate_off_tools]
-        == ["reply", "send_emoji", "query_memory"],
+        == ["reply", "send_emoji", "switch_chat", "query_memory"],
         "自主发言闸门默认关：工具清单一个字都不动",
     )
 
@@ -2120,6 +2160,120 @@ async def test_plugin(tmp: str) -> None:
         "reply" not in _gate_wbo_tools,
         "note_to_planner 关着时闸门仍要生效（不跟边界感共用一个提前返回）",
     )
+
+    # ── 静音窗端到端：判了不说之后，**换个会话**也得闭嘴 ──
+    #
+    # 这是 focus 模式的漏洞：判了「不在这说」，模型可以改用 switch_chat 切到
+    # 别的会话，而切过去会开新的一轮、闸门在干净上下文里重新判——于是
+    # 「不在这说」变成了「去别处说」。窗口必须跨会话生效。
+    plugin._mute_until = 0.0  # type: ignore[union-attr]
+    _set_boundary(note_to_planner=True)
+    _set_initiative(enabled=True, mute_seconds=30.0, gate_switch_chat=False)
+    # 一个好感 99 的人：单看软评分她一定会开口。
+    store.upsert_person({
+        "person_key": "qq:20003", "platform": "qq", "user_id": "20003",
+        "display_name": "老朋友", "relation_role": "friend", "role_confidence": 1.0,
+        "role_source": "manual", "affection": 99.0, "tags": [],
+        "axes": {"trust": 0.8, "closeness": 0.8, "respect": 0.7,
+                 "tension": 0.0, "familiarity": 0.8, "perceived_warmth": 0.8},
+    })
+    _gate_friend_sid = "qq:private:mutecheck"
+    store.upsert_state(_gate_friend_sid, chat_type="private", platform="qq",
+                       user_id="20003", user_nickname="老朋友", pending_count=0)
+    _gate_friend = await plugin.inject_planner_state(
+        session_id=_gate_friend_sid, items=json.loads(json.dumps(_gate_items)),
+        item_schema_version=1, tool_definitions=json.loads(json.dumps(_gate_tools)),
+    )
+    _gate_friend_tools = [
+        d["function"]["name"]
+        for d in ((_gate_friend.get("modified_kwargs") or {}).get("tool_definitions") or [])
+    ]
+    check("reply" in _gate_friend_tools, "高好感的人说话时她本来能开口（对照组）")
+    check(plugin._mute_until == 0.0, "允许开口时不该打开静音窗")  # type: ignore[union-attr]
+
+    # 现在让她在一个低好感的会话里判一次「不说」——窗口应该打开。
+    # 用一个**全新的会话**：bd_sid 上面刚被种过 @ 时间窗，@ 会优先放行，
+    # 拿它测「说不了话」只会测出「@ 让路了」。
+    _gate_deny_sid = "qq:private:mutedeny"
+    store.upsert_state(_gate_deny_sid, chat_type="private", platform="qq",
+                       user_id="20002", user_nickname="老王", pending_count=0)
+    plugin._mute_until = 0.0  # type: ignore[union-attr]
+    _gate_deny = await plugin.inject_planner_state(
+        session_id=_gate_deny_sid, items=json.loads(json.dumps(_gate_items)),
+        item_schema_version=1, tool_definitions=json.loads(json.dumps(_gate_tools)),
+    )
+    _gate_deny_tools = [
+        d["function"]["name"]
+        for d in ((_gate_deny.get("modified_kwargs") or {}).get("tool_definitions") or [])
+    ]
+    check("reply" not in _gate_deny_tools, "低好感会话里照旧收回 reply")
+    check(plugin._mute_until > time.time(), "判了不说之后静音窗打开了")  # type: ignore[union-attr]
+
+    # 关键：**换回那个高好感的会话**。软评分本来会放行，但窗口必须压住它。
+    _gate_after_mute = await plugin.inject_planner_state(
+        session_id=_gate_friend_sid, items=json.loads(json.dumps(_gate_items)),
+        item_schema_version=1, tool_definitions=json.loads(json.dumps(_gate_tools)),
+    )
+    _gate_after_mute_tools = [
+        d["function"]["name"]
+        for d in ((_gate_after_mute.get("modified_kwargs") or {}).get("tool_definitions") or [])
+    ]
+    check(
+        "reply" not in _gate_after_mute_tools,
+        "静音窗跨会话生效（否则 focus 下「不在这说」会变成「去别处说」）",
+    )
+    check(
+        "switch_chat" in _gate_after_mute_tools,
+        "默认不收回 switch_chat（收了她连「去看看别的群」都做不到，focus 就废了）",
+    )
+
+    # 窗口不能被续期。否则每轮 pluanner 都往后推 30 秒，等于永久静音。
+    _mute_before = plugin._mute_until  # type: ignore[union-attr]
+    await plugin.inject_planner_state(
+        session_id=_gate_deny_sid, items=json.loads(json.dumps(_gate_items)),
+        item_schema_version=1, tool_definitions=json.loads(json.dumps(_gate_tools)),
+    )
+    check(
+        plugin._mute_until == _mute_before,  # type: ignore[union-attr]
+        "已在窗内时不再续窗（续了就是永久静音，和原来那个 bug 同形状）",
+    )
+
+    # 被 @ 优先于静音窗：真有人叫她，窗得让路。
+    plugin._tracker.mark_dirty({  # type: ignore[union-attr]
+        "session_id": _gate_friend_sid, "platform": "qq", "message_info": {
+            "group_info": {"group_id": "", "group_name": ""},
+            "user_info": {"user_id": "20003", "user_nickname": "老朋友"},
+        }, "is_at": True, "is_mentioned": False,
+    })
+    _gate_muted_at = await plugin.inject_planner_state(
+        session_id=_gate_friend_sid, items=json.loads(json.dumps(_gate_items)),
+        item_schema_version=1, tool_definitions=json.loads(json.dumps(_gate_tools)),
+    )
+    _gate_muted_at_tools = [
+        d["function"]["name"]
+        for d in ((_gate_muted_at.get("modified_kwargs") or {}).get("tool_definitions") or [])
+    ]
+    check("reply" in _gate_muted_at_tools, "@ 优先于静音窗（真有人叫她，窗得让路）")
+
+    # 打开 gate_switch_chat 后，窗内连 switch_chat 一起收回。
+    plugin._mute_until = time.time() + 30.0  # type: ignore[union-attr]
+    _set_initiative(enabled=True, gate_switch_chat=True)
+    _gate_no_switch = await plugin.inject_planner_state(
+        session_id=_gate_sid2, items=json.loads(json.dumps(_gate_items)),
+        item_schema_version=1, tool_definitions=json.loads(json.dumps(_gate_tools)),
+    )
+    _gate_no_switch_tools = [
+        d["function"]["name"]
+        for d in ((_gate_no_switch.get("modified_kwargs") or {}).get("tool_definitions") or [])
+    ]
+    check(
+        "switch_chat" not in _gate_no_switch_tools,
+        "打开 gate_switch_chat 后窗内也收回 switch_chat",
+    )
+    plugin._mute_until = 0.0  # type: ignore[union-attr]
+    store.delete_person("qq:20003")
+    store.conn.execute("DELETE FROM gap_state WHERE session_id = ?", (_gate_friend_sid,))
+    store.conn.commit()
     _set_initiative(enabled=False)
     plugin._mood.reset()  # type: ignore[union-attr]
 
@@ -2934,7 +3088,7 @@ def test_config() -> None:
                 missing_label.append(f"[{section}].{name}")
             if not hint or not has_cjk(hint):
                 missing_hint.append(f"[{section}].{name}")
-    check(total == 168, f"{len(sections)} 个节共 168 个配置项（实际 {total}）")
+    check(total == 170, f"{len(sections)} 个节共 170 个配置项（实际 {total}）")
     check(not missing_label, f"每个配置项都有中文 label（缺 {missing_label}）")
     check(not missing_hint, f"每个配置项都有中文 hint（缺 {missing_hint}）")
 
@@ -4905,7 +5059,28 @@ def test_initiative() -> None:
     )
 
     # ── 好感度 / 心情 ──
-    check(init_mod.affection_score(0.0) == 0.0, "好感度为 0 时分数为 0")
+    # 好感度是**分档**不是线性除法。真机 16 个人的分布是长尾：一个 owner 99、
+    # 一个熟人 22.6，其余 14 个贴在 0 附近（还有一个 -21.5）。线性归一之后除
+    # owner 外所有人都在 0.28 以下，等于「陌生人一律不许说话」——但「陌生」是
+    # 中性值，不该被当成最低分。
+    check(
+        init_mod.affection_score(0.0) == init_mod.AFFECTION_TIERS[4][1],
+        "好感度为 0 是「陌生」这个中性档，不是最低分",
+    )
+    check(init_mod.affection_score(-1.0) == init_mod.AFFECTION_HOSTILE, "负好感归零（明确不想理）")
+    check(init_mod.affection_score(-99.0) == init_mod.AFFECTION_HOSTILE, "负多少都归零")
+    check(
+        init_mod.affection_score(0.0) < init_mod.affection_score(25.0),
+        "陌生人 < 熟人",
+    )
+    check(
+        init_mod.affection_score(25.0) < init_mod.affection_score(50.0),
+        "熟人 < 朋友",
+    )
+    check(
+        init_mod.affection_score(65.0) < init_mod.affection_score(85.0),
+        "亲近 < owner",
+    )
     check(
         init_mod.affection_score(init_mod.AFFECTION_CEILING) >= 0.99,
         "好感度到顶时分数到顶",
@@ -4913,6 +5088,11 @@ def test_initiative() -> None:
     check(
         init_mod.affection_score(999.0) <= 1.0,
         "好感度再高也不超过 1.0",
+    )
+    check(
+        init_mod.affection_score(99.0) >= 0.99,
+        "**回归**：真机那个好感 99 的 owner 必须满分（原线性归一他只有 1.0 没错，"
+        "但旁边的熟人 22.6 只有 0.28，全被锁死）",
     )
     check(init_mod.mood_score(valence=1.0, arousal=1.0) >= 0.99, "心情很好时分高")
     check(init_mod.mood_score(valence=-1.0, arousal=0.0) <= 0.01, "心情很差时分低")
@@ -4957,6 +5137,25 @@ def test_initiative() -> None:
         "边界感判「不想接话」时主动必须一起压掉（两处共用一个闸门）",
     )
 
+    # ── 静音窗 ──
+    # focus 模式下判了「这轮不说」，模型可以改用 switch_chat 切到别的会话，
+    # 而切过去会开新的一轮、闸门在干净上下文里重新判——「不在这说」变成
+    # 「去别处说」。静音窗是进程级的，不按会话记。
+    muted = init_mod.evaluate(muted=True)
+    check(not muted.allow, "静音窗内不开口")
+    check(muted.hard, "静音窗是硬过滤，不参与软评分")
+    check(muted.reason == init_mod.REASON_MUTED, "原因要能看出是静音窗拦的")
+
+    muted_at = init_mod.evaluate(muted=True, at_pending=True, at_always_reply=True)
+    check(muted_at.allow and muted_at.reason == init_mod.REASON_AT, "@ 穿透静音窗（叫名字就该应声）")
+
+    muted_worse = init_mod.evaluate(muted=True, text="原神", likes=["原神"],
+                                    affection=99.0, valence=1.0, arousal=1.0)
+    check(not muted_worse.allow, "静音窗优先于软评分——分数再高也不开口")
+
+    muted_exhausted = init_mod.evaluate(muted=True, exhausted=True)
+    check(muted_exhausted.reason == init_mod.REASON_MUTED, "静音窗排在能耗尽之前判")
+
     # ── 软评分 ──
     good = init_mod.evaluate(
         text="今天原神新版本", likes=["原神"],
@@ -4972,9 +5171,43 @@ def test_initiative() -> None:
     check(not bad.allow, f"三样都差时不该开口（score={bad.score:.2f}）")
     check(bad.reason == init_mod.REASON_LOW_SCORE, "拦截的原因是「分数不够」")
     check(
-        set(bad.parts) == {"interest", "affection", "mood", "energy"},
-        "分数明细要能逐项看到（日志里靠它排查「为什么不说话」）",
+        set(bad.parts) == {"affection", "mood"},
+        "分数明细要能逐项看到；兴趣没命中就不该出现在明细里",
     )
+    check(
+        "energy" not in bad.parts,
+        "**精力不参与软评分**：它已经有自己的硬闸，再算一遍是同一个原因算两遍",
+    )
+
+    # 精力高低不能改变分数——这是「闸门管能不能、软分管想不想」的分界。
+    _calm = dict(text="随便聊聊", likes=[], affection=50.0, valence=0.3, arousal=0.5)
+    _full = init_mod.evaluate(energy=1.0, **_calm)
+    _empty = init_mod.evaluate(energy=0.0, **_calm)
+    check(
+        abs(_full.score - _empty.score) < 1e-9,
+        f"精力 1.0 和 0.0 的软评分必须相同（{_full.score:.3f} vs {_empty.score:.3f}）",
+    )
+
+    # 兴趣只有命中才参与归一化。
+    # 历史 bug：不管有没有命中都把 0.40 算进分母，等于「这次聊的东西不在她
+    # 喜欢的话题里」被倒扣 0.40。群里正常聊天基本不命中那些具体话题，于是
+    # 分数上限被压到 0.60，实际上只有 owner 过得去门槛——闸门在最该生效的
+    # 场合变成了永久静音。
+    _miss = init_mod.evaluate(text="今天天气不错", likes=["原神"], affection=22.6,
+                              valence=0.0, arousal=0.5)
+    check("interest" not in _miss.parts, "没命中兴趣时该项不参与打分（不是记 0 分）")
+    check(
+        _miss.allow,
+        f"**回归**：好感 22.6 的正常群聊应该能开口（原来会被永久静音，"
+        f"score={_miss.score:.2f}）",
+    )
+    _hit = init_mod.evaluate(text="今天原神新版本", likes=["原神"], affection=0.0,
+                             valence=0.0, arousal=0.5)
+    check("interest" in _hit.parts, "命中兴趣时该项参与打分")
+    check(_hit.allow, f"陌生人聊到她喜欢的话题也该能接（score={_hit.score:.2f}）")
+    _hostile = init_mod.evaluate(text="今天原神新版本", likes=["原神"], affection=-21.5,
+                                 valence=0.0, arousal=0.5)
+    check(not _hostile.allow, "负好感的人聊到她喜欢的话题也不开口")
 
     # 没有文本时 interest 不参与，权重重新归一化 —— 否则「没话题」会被系统性压低分
     no_text = init_mod.evaluate(
@@ -5021,7 +5254,17 @@ def test_initiative() -> None:
     # ── 描述 ──
     text = init_mod.describe(bad)
     check("分数不够" in text, "描述里带原因")
-    check("score=" in text and "interest=" in text, "描述里带各项分数")
+    check("score=" in text, "描述里带分数")
+    check(
+        "affection=" in text and "mood=" in text,
+        "描述里带各项分数（日志里靠它排查「为什么不说话」）",
+    )
+    check(
+        "interest=" not in text,
+        "没命中兴趣时描述里也不该出现 interest（出现了就说明分母被算进去了）",
+    )
+    described_hit = init_mod.describe(_hit)
+    check("interest=" in described_hit, "命中兴趣时描述里要有 interest 那一项")
 
 
 def test_backfill() -> None:
@@ -5326,6 +5569,93 @@ def test_history() -> None:
     check(history_mod.MAX_HOLE_ROWS >= 100, "原文至少留得下 100 条")
 
 
+def test_guard() -> None:
+    """脏文本防御：别的插件往消息正文里塞的东西不能变成她的记忆。
+
+    真机样本：``mai_messages`` 里那条 bot 收到的消息，
+    ``processed_plain_text`` 尾部挂着 ``[热梗：67]\\n怎么用/怎么接：…``
+    （``meme-insight-plugin`` 追加的）。而 ``cg_extract._text_of()`` 优先读
+    ``processed_plain_text`` → 被当成聊天内容 → 抽成 creative/self 记忆 →
+    注入 extra_prompt → 模型照着复述 → 发出去。这解释了反馈里那句
+    「运行久了会把日志发出去」——要先攒够记忆才会出现。
+
+    这里的断言分两半，两边都不能松：
+    脏的一条都不能漏（漏了就会说话），**干净的一条都不能误杀**（误杀比漏更糟：
+    那等于她的记忆凭空消失，而且没有任何提示）。
+    """
+
+    print("[17] 脏文本防御")
+    guard_mod = importlib.import_module(f"{_PKG_NAME}.cg_guard")
+
+    dirty = [
+        "[热梗：67]\n怎么用/怎么接：群友说「鸡你太美」时你可以回一句…",
+        'Traceback (most recent call last):\n  File "x.py", line 12, in f',
+        '  File "/app/plugin.py", line 88, in on_load',
+        "INFO | [companion-gap] 注入 8 条 + 跨流 3 条 / 人物 0 个",
+        "DEBUG | something happened",
+        "ERROR | 出错了",
+        "/app/logs/app_20261105.log.jsonl",
+        "<plugin_proactive_task id=proactive:x:1>\n插件请求你主动处理一轮聊天：…",
+        "<plugin_reply_hint>记得别提这个</plugin_reply_hint>",
+        "[companion-mood]【你此刻的心境】生气",
+        '{"items":[{"category":"open_loop","content":"…"}],"mood":{}}',
+        '[{"a": 1}, {"b": 2}]',
+    ]
+    for sample in dirty:
+        check(
+            not guard_mod.is_clean(sample),
+            f"认出系统文本：{sample.splitlines()[0][:34]}",
+        )
+        check(
+            guard_mod.system_text_reason(sample) != "",
+            f"给出人能看懂的原因：{sample.splitlines()[0][:28]}",
+        )
+
+    # 真机那条最关键：它长得像聊天，但方括号里带冒号的短标签暴露了它。
+    check(
+        "方括号" in guard_mod.system_text_reason("[热梗：67]\n怎么用/怎么接：…"),
+        "真机样本判成「方括号系统标签」",
+    )
+
+    clean = [
+        "怠惰想换手机但还没报预算和需求",
+        "锅巴提议去监狱做擒贼擒王",
+        "[图片]",
+        "[表情]",
+        "",
+        "   ",
+        "主人今天好凶",
+        "哈哈哈这个梗我笑死",
+        "他说「[热梗]」这个词是最近才火的",
+        "1 加 1 等于 2",
+    ]
+    for sample in clean:
+        check(guard_mod.is_clean(sample), f"不误杀正常内容：{sample[:24] or '（空串）'}")
+
+    check(guard_mod.is_clean(None), "None 当成空内容，不算脏")
+    check(guard_mod.system_text_reason(None) == "", "None 不给原因")
+
+    # 反向断言：扫描窗口不能开太大。整段对话里偶尔夹一句日志，不该把
+    # 整条消息一起丢掉——那样等于她的记忆凭空消失。
+    check(guard_mod._SCAN_CHARS <= 800, "扫描窗口别开太大，否则整段对话会被连坐")
+    check(
+        guard_mod.is_clean("今天我们聊了好多事情，" * 40),
+        "长正常文本不误杀",
+    )
+    # 脏东西出现在**开头**才算脏：消息开头就是堆栈 = 系统文本；
+    # 提到「Traceback」这个词 = 人在聊这件事，不该拦。
+    # 注意「Traceback (most recent call last)」整句是**不锚定**匹配的，
+    # 因为它长得太不像人话，人不会正好把这整句引用出来。
+    check(
+        not guard_mod.is_clean("Traceback (most recent call last):\n  File \"x.py\""),
+        "开头就是堆栈的要拦",
+    )
+    check(
+        guard_mod.is_clean("今天我在日志里看到 Traceback 这个词，吓了一跳"),
+        "聊天里提到「Traceback」这个词不算脏",
+    )
+
+
 # ── 主流程 ──
 
 async def main() -> None:
@@ -5353,6 +5683,7 @@ async def main() -> None:
         test_initiative()
         test_backfill()
         test_history()
+        test_guard()
         await test_energy_gate(tmp)
     finally:
         for store in list(_OPEN_STORES):

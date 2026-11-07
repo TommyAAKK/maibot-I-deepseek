@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover - 仅用于脱离 Runner 的本地导入
 from .cg_person import DEFAULT_INTIMACY_LEVELS, DEFAULT_ROLES
 
 
-CONFIG_VERSION = "1.1.0"
+CONFIG_VERSION = "1.2.0"
 
 #: 本插件负责补全的五类情境记忆。顺序即注入时的展示顺序。
 ALL_CATEGORIES: tuple[str, ...] = (
@@ -732,6 +732,28 @@ class InitiativeConfig(PluginConfigBase):
             "记录判定原因",
             "强烈建议开着。主动功能最难排查的就是「它为什么不说话」，"
             "日志里要能直接看到原因和各项分数",
+        ),
+    )
+    mute_seconds: float = Field(
+        default=30.0,
+        ge=0.0,
+        le=600.0,
+        description="判「这轮不说话」之后的静音窗口秒数",
+        json_schema_extra=_ui(
+            "静音窗（秒）",
+            "focus 模式下「不在这说」很容易变成「用 switch_chat 去别处看看」——"
+            "切过去是**新的一轮、新的会话**，闸门会在干净的上下文里重新判一次，"
+            "于是话还是说出去了。所以判 deny 之后记一个进程级的静音窗，窗口内"
+            "换到哪个会话都不开口。@ 仍然穿透这个窗口。设 0 关闭",
+        ),
+    )
+    gate_switch_chat: bool = Field(
+        default=False,
+        description="静音窗内是否连 switch_chat 一起收回",
+        json_schema_extra=_ui(
+            "静音窗内也不许换台",
+            "默认关——拿掉 reply 就够拦住「说出来」了；把 switch_chat 也拿走"
+            "会让她连「去看看别的群」都做不到，focus 模式等于废掉",
         ),
     )
 
