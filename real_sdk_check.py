@@ -367,6 +367,17 @@ def _check_api_call_style() -> None:
     )
 
 
+#: 反序列化的 `item_type` 白名单在这几个文件里都可能出现——宿主 1.3.19
+#: 把它从 ``src/llm_models/request_snapshot.py`` 挪到了
+#: ``src/llm_models/payload_content/context_snapshot.py``。**旧路径找不到时
+#: 这一节会静默跳过并打印「通过」**，等于白写，所以这里按候选列表挨个试，
+#: 一个都找不到才算真的「宿主版本不认识」。
+_SNAPSHOT_SOURCES: tuple[str, ...] = (
+    "src/llm_models/payload_content/context_snapshot.py",
+    "src/llm_models/request_snapshot.py",
+)
+
+
 def _host_supported_item_types(source_root: Path) -> set[str]:
     """从宿主源码里抽出「快照 item_type 认哪些字符串」。
 
@@ -379,23 +390,26 @@ def _host_supported_item_types(source_root: Path) -> set[str]:
 
     import ast
 
-    target = source_root / "src" / "llm_models" / "request_snapshot.py"
-    if not target.is_file():
-        return set()
-    try:
-        tree = ast.parse(target.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return set()
     found: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare):
+    for relative in _SNAPSHOT_SOURCES:
+        target = source_root / relative
+        if not target.is_file():
             continue
-        if not isinstance(node.left, ast.Name) or node.left.id != "item_type":
+        try:
+            tree = ast.parse(target.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
             continue
-        for op, comparator in zip(node.ops, node.comparators):
-            if isinstance(op, ast.Eq) and isinstance(comparator, ast.Constant):
-                if isinstance(comparator.value, str) and comparator.value:
-                    found.add(comparator.value)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            if not isinstance(node.left, ast.Name) or node.left.id != "item_type":
+                continue
+            for op, comparator in zip(node.ops, node.comparators):
+                if isinstance(op, ast.Eq) and isinstance(comparator, ast.Constant):
+                    if isinstance(comparator.value, str) and comparator.value:
+                        found.add(comparator.value)
+        if found:
+            break
     return found
 
 
@@ -424,7 +438,11 @@ def _check_planner_items_with_host(instance) -> None:
 
     supported = _host_supported_item_types(source_root)
     if not supported:
-        print("  跳过：宿主 request_snapshot.py 里没解析出 item_type 白名单")
+        print(
+            "  跳过：宿主这几个文件里都没解析出 item_type 白名单（"
+            + " / ".join(_SNAPSHOT_SOURCES)
+            + "）"
+        )
         return
     check(
         "SystemMessageItem" in supported,

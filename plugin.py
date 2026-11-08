@@ -445,6 +445,10 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
             log_extract_raw=cfg.debug.log_extract_raw,
             mood=mood,
             gate=self._gate,
+            # 洞判据要用在线区间：补抓回来的那批消息里，落在她离线时段的那几条
+            # 才算「没看见」。走回调读同一份内存缓存，不另查库——两边必须一致，
+            # 否则同一段时间会一边说「她那会儿不在」一边说「她一直在等」。
+            online_windows_getter=lambda: list(self._online_windows),
         )
         await self._tracker.start()
 

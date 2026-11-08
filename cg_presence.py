@@ -55,6 +55,13 @@ OFFLINE_DOMINANT = 0.5
 #: 与 :data:`cg_absence.DEFAULT_MIN_HOURS` 对齐。低于这个时长一律不提。
 DEFAULT_MIN_HOURS = 6.0
 
+#: 判「这段是离线」的最短时长（秒）。
+#:
+#: 宿主的 ``online_time`` 是分段记录的，相邻两段之间本来就会有几秒钟到几分钟
+#: 的空档（进程重启、切会话、心跳间隔）。那不是「她不在」。真实缺席是小时级，
+#: 所以 10 分钟的线足够干净，而且不会把一堆碎片当成洞。
+MIN_OFFLINE_SECONDS = 600.0
+
 
 @dataclass(slots=True)
 class Presence:
@@ -321,6 +328,62 @@ _AWAY_PHRASES: dict[str, str] = {
     "private": "（你这{how}没在——不是对方没来，是你不在。）",
     "group": "（这个群{how}没动静，不过那段时间你也不在。）",
 }
+
+
+def offline_spans(
+    windows: Sequence[tuple[datetime, datetime]],
+    *,
+    start_ts: float,
+    end_ts: float,
+    min_seconds: float = MIN_OFFLINE_SECONDS,
+) -> list[tuple[float, float]]:
+    """把「在线区间」翻成「离线区间」，只保留 ``start_ts`` 之后的部分。
+
+    这是给「洞」判定用的：一条消息如果落在这里面，就说明她当时根本不在，
+    那条消息她**一条都没看见**。
+
+    三条刻意的保守设计：
+
+    1. **只取第一段在线区间之后的部分。** ``online_time`` 只保留 30 天，读出
+       来之前的时间是「不知道」而不是「不在线」。把不知道算成不在线，会让
+       每个老会话一启动就报「你错过了一大段」。
+    2. ``min_seconds`` 以下的小空档不算离线。宿主的 ``online_time`` 是分段
+       记录，相邻两段之间本来就可能有几分钟空档（进程重启、切会话），那不算
+       「她不在」。真实缺席是小时级，10 分钟的线足够干净。
+    3. 末尾敞口不封口：最后一段在线区间之后到现在，如果它够长，也是离线。
+       这正是「关机一整夜」的形状。
+
+    Returns:
+        ``(start_ts, end_ts)`` 浮点 unix 秒列表，按起点升序。
+    """
+
+    if not windows:
+        return []
+    floor = max(0.0, float(start_ts))
+    ceiling = max(floor, float(end_ts))
+    minimum = max(0.0, float(min_seconds))
+    zone = windows[0][0].tzinfo or timezone.utc
+
+    spans: list[tuple[float, float]] = []
+    cursor = max(floor, windows[0][0].timestamp())
+    if cursor > floor:
+        # 第一段在线记录之前是「不知道」，不是离线——把游标推到第一段起点，
+        # 这样它前面的空档不会变成洞。
+        cursor = max(floor, windows[0][0].timestamp())
+    for win_start, win_end in windows:
+        begin = win_start.timestamp()
+        finish = win_end.timestamp()
+        if finish <= floor:
+            continue
+        if begin > cursor and begin - cursor >= minimum:
+            spans.append((cursor, min(begin, ceiling)))
+        cursor = max(cursor, finish)
+        if cursor >= ceiling:
+            break
+    if ceiling - cursor >= minimum:
+        spans.append((cursor, ceiling))
+    _ = zone  # 时区只用于解释输入，输出统一是 unix 秒
+    return [(max(0.0, s), max(0.0, e)) for s, e in spans if e > s]
 
 
 def render_away_note(*, hours: float, how: str, chat_type: str = "private") -> str:

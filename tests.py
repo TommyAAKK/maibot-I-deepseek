@@ -5285,6 +5285,54 @@ def test_presence() -> None:
         "「此刻在线」的判定也要有容差",
     )
 
+    # ── 离线区间：洞判据的输入 ──
+    #
+    # 这一组是补抓路径那个 bug 的补丁。判据从「超出读窗口的部分」换成
+    # 「时间戳落在她离线区间里的消息」，所以区间的算法必须单独钉住。
+    _d = lambda h, m=0: base + timedelta(hours=h, minutes=m)
+    _two = [(_d(0), _d(1)), (_d(3), _d(4))]  # 在线 0-1、3-4，那么 1-3 是离线
+    _spans = presence_mod.offline_spans(_two, start_ts=_d(0).timestamp(), end_ts=_d(5).timestamp())
+    check(len(_spans) == 2, "两段在线之间 + 末尾敞口，各算一段离线")
+    check(
+        abs(_spans[0][0] - _d(1).timestamp()) < 1 and abs(_spans[0][1] - _d(3).timestamp()) < 1,
+        "中间那段离线正好是两段在线之间的空档",
+    )
+    check(
+        abs(_spans[1][0] - _d(4).timestamp()) < 1,
+        "末尾敞口从最后一段在线结束算起",
+    )
+    check(
+        all(e > s for s, e in _spans), "不会有零长度或倒序的区间"
+    )
+    check(
+        presence_mod.offline_spans([], start_ts=0, end_ts=100) == [],
+        "没有在线数据就返回空（不知道 ≠ 不在）",
+    )
+    check(
+        presence_mod.offline_spans(
+            [(_d(5), _d(6))], start_ts=_d(0).timestamp(), end_ts=_d(5, 30).timestamp()
+        )
+        == [],
+        "**第一段在线之前的时间不算离线**（online_time 只留 30 天，之前是「不知道」）",
+    )
+    _short = presence_mod.offline_spans(
+        [(_d(0), _d(1)), (_d(1, 3), _d(4))],
+        start_ts=_d(0).timestamp(),
+        end_ts=_d(4).timestamp(),
+    )
+    check(_short == [], "三分钟的小空档不算离线（进程重启不是缺席）")
+    check(
+        presence_mod.MIN_OFFLINE_SECONDS >= 300,
+        "离线判定的最短时长不能太短，否则每个重启都被当成她不在",
+    )
+    _tail = presence_mod.offline_spans(
+        [(_d(0), _d(1))], start_ts=_d(0).timestamp(), end_ts=_d(10).timestamp()
+    )
+    check(
+        len(_tail) == 1 and abs(_tail[0][1] - _d(10).timestamp()) < 1,
+        "最后一段在线之后到现在也是离线（关机一整夜的形状）",
+    )
+
 
 def test_initiative() -> None:
     """自主发言闸门：兴趣 / 好感度 / 心情 加权，硬过滤优先。
@@ -5882,6 +5930,52 @@ def test_history() -> None:
     check(len(hole2) == 2, "上次抽取之前的消息不算本次的洞")
     check(history_mod.split_window(msgs, 0)[0] == [], "max_read=0 时窗口为空")
     check(history_mod.split_window([], 3) == ([], []), "空输入返回两个空列表")
+
+    # ── L1 补丁：离线时段里的消息，不管在不在窗口内都是洞 ──
+    #
+    # 原来只有一条判据「超出读窗口的部分」。真机上它从来没生效过：补抓回来
+    # 20 条全塞进 30 条的窗口，洞是空的、gap_unread 一直 0 行，于是她读完那
+    # 20 条就像从头到尾都在场——而那 20 条里有一半是她关机期间别人说的话。
+    _hb = 1_800_000_000.0
+    _span_msgs = [
+        {"message_id": f"s{i}", "timestamp": str(_hb + i * 60), "processed_plain_text": f"第{i}条"}
+        for i in range(20)
+    ]
+    _offline = [(_hb + 300.0, _hb + 900.0)]
+    _w_old, _h_old = history_mod.split_window(_span_msgs, 30)
+    check(len(_h_old) == 0, "旧判据下这批消息全在窗口里，洞是空的（正是那个 bug）")
+    _w_new, _h_new = history_mod.split_window(
+        _span_msgs, 30, offline_spans=_offline
+    )
+    check(len(_h_new) == 11, "离线时段里的 11 条全部记成洞")
+    check(
+        not [m for m in _w_new if history_mod.in_spans(history_mod.message_stamp(m), _offline)],
+        "**落到洞里的消息必须从读窗口里拿掉**（两边都知道等于自相矛盾）",
+    )
+    _hole_stamps = [history_mod.message_stamp(m) for m in _h_new]
+    check(_hole_stamps == sorted(_hole_stamps), "洞按时间升序（否则「06:42 到 10:47」会被说反）")
+    check(
+        history_mod.in_spans(_hb + 300.0, _offline) and history_mod.in_spans(_hb + 900.0, _offline),
+        "区间两端都算在里面",
+    )
+    check(
+        not history_mod.in_spans(_hb + 901.0, _offline) and not history_mod.in_spans(0, _offline),
+        "区间外、以及没有时间戳的都不算",
+    )
+    _w_e, _h_e = history_mod.split_window(_span_msgs, 30, offline_spans=[])
+    check(
+        (len(_w_e), len(_h_e)) == (20, 0),
+        "**没有在线数据时行为必须和旧版完全一致**（不知道 ≠ 不在）",
+    )
+    _w_n, _h_n = history_mod.split_window(_span_msgs, 30, offline_spans=None)
+    check((len(_w_n), len(_h_n)) == (20, 0), "offline_spans=None 与旧版一致")
+    _w_f, _h_f = history_mod.split_window(
+        _span_msgs, 30, since_ts=_hb + 400.0, offline_spans=_offline
+    )
+    check(
+        all(history_mod.message_stamp(m) > _hb + 400.0 for m in _h_f),
+        "上次抽取之前的不算本次的洞（离线判据也不能把老账翻出来）",
+    )
 
     # ── L1 摘要：只有条数和时间 ──
     summary = history_mod.summarize_hole(hole)

@@ -31,7 +31,15 @@ from .cg_backfill import (
 )
 from .cg_extract import format_transcript, frame_self_lines, run_extraction
 from .cg_guard import system_text_reason
-from .cg_history import describe_span, message_text, split_window, summarize_hole, to_history_rows
+from .cg_history import (
+    describe_span,
+    message_stamp,
+    message_text,
+    split_window,
+    summarize_hole,
+    to_history_rows,
+)
+from .cg_presence import offline_spans
 from .cg_person import (
     accumulate_impact,
     affection_from_axes,
@@ -130,6 +138,7 @@ class SessionTracker:
         log_extract_raw: bool = False,
         mood: Any = None,
         gate: Any = None,
+        online_windows_getter: Callable[[], list[Any]] | None = None,
     ) -> None:
         self._ctx = ctx
         self._store = store
@@ -143,6 +152,14 @@ class SessionTracker:
         #: replyer hook —— 因为精力耗尽后 Bot 不再回复，那个 hook 根本不会触发，
         #: 门控就永远等不到恢复的时机。
         self._gate = gate
+        #: 读「在线区间」的回调（由 ``plugin.py`` 提供，读的是它那份内存缓存）。
+        #:
+        #: 为什么要回调而不是自己查：在线时段是宿主 ``online_time`` 表的
+        #: 8600 行聚合，插件侧已经有一个后台任务每 10 分钟刷一次，这里再查
+        #: 一遍纯属重复；更要紧的是**两边必须用同一份数据**——否则「补抓算出的
+        #: 离线区间」和「注入时算的缺席感」会对不上，同一段时间一边说「她那会儿
+        #: 不在」一边说「她一直在等」。
+        self._online_windows_getter = online_windows_getter
         #: 机器人自身的账号 ID 集合。从「全量消息 vs filter_mai 消息」的差集
         #: 里学习得到，再并上配置 ``[people] self_identities``。用途只有一个：
         #: **不把她自己当成聊天里的「别人」记进人物表**。
@@ -596,7 +613,13 @@ class SessionTracker:
         # 「那会儿我不在」。
         _state = self._store.get_state(entry.session_id) or {}
         _last_extract = float(_state.get("last_extract_ts") or 0.0)
-        window, hole = split_window(messages, max_msgs, since_ts=_last_extract)
+        offline = self._offline_spans(messages, since_ts=_last_extract)
+        window, hole = split_window(
+            messages,
+            max_msgs,
+            since_ts=_last_extract,
+            offline_spans=offline,
+        )
         if hole:
             await self._record_hole(entry, hole)
 
@@ -1455,6 +1478,56 @@ class SessionTracker:
                 self._debug(f"学习机器人账号失败（不影响抽取）: {exc!r}")
 
         return messages
+
+    def _offline_spans(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        since_ts: float,
+    ) -> list[tuple[float, float]]:
+        """算出「这批消息里，哪些时间她根本不在线」。
+
+        这是补抓路径上「洞」判定的补丁。原来的判据只有一条：**超出读窗口的
+        部分**。真机上那条判据从来没生效过——补抓回来 20 条，全塞进 30 条的
+        窗口，洞是空的，``gap_unread`` 一直 0 行。于是她读完那 20 条就像从头
+        到尾都在场，而其中一半是她关机期间别人说的话。
+
+        现在改成看**时间戳**：落在她离线区间里的消息，不管在不在窗口内，都是
+        她没看见的。读窗口也把这几条扣掉——告诉她「这 10 条你一条都没看到」
+        又把它们塞进读窗口，等于自相矛盾。
+
+        拿不到在线数据时返回空列表，行为与旧版完全一致。理由和
+        :func:`cg_presence.offline_spans` 一样：**不知道 ≠ 不在**。
+        """
+
+        if not messages:
+            return []
+        getter = self._online_windows_getter
+        if getter is None:
+            return []
+        try:
+            windows = getter()
+        except Exception as exc:  # noqa: BLE001 - 拿不到就退回旧判据
+            self._debug(f"读取在线区间失败（洞判据退回旧算法）: {exc!r}")
+            return []
+        if not windows:
+            return []
+
+        stamps = [message_stamp(item) for item in messages]
+        stamps = [value for value in stamps if value > 0]
+        if not stamps:
+            return []
+
+        # 区间上界用现在：她可能到现在还没回来，那段也是「不在」。
+        try:
+            return offline_spans(
+                windows,
+                start_ts=min(stamps),
+                end_ts=time.time(),
+            )
+        except Exception as exc:  # noqa: BLE001 - 算不出来就退回旧判据
+            self._debug(f"换算离线区间失败（洞判据退回旧算法）: {exc!r}")
+            return []
 
     async def _backfill(
         self,
