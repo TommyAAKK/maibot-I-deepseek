@@ -377,6 +377,52 @@
   .cg-pref-meta { font-size: 11.5px; color: var(--cg-muted); }
   .cg-pref-act { margin-left: auto; display: flex; gap: 6px; }
   .cg-prefs-tip { margin: 8px 0 0; font-size: 11.5px; color: var(--cg-muted); }
+  /* 念头 / 留念 / 主动：三块都排在记忆下面，都默认折叠。
+     它们都是「她自己想出来的东西」，不是查记忆时顺带要看的东西——折起来
+     只留标题行（标题行右侧写着「还惦记着 3 件」这类计数），不展开也知道
+     个大概，展开也不至于把记忆挤到屏幕外。
+     视觉上刻意比记忆轻一档：左侧不带强调色条，正文用常规字重。 */
+  .cg-thought-list, .cg-keepsake-list, .cg-spark-list {
+    margin-top: 8px; display: flex; flex-direction: column; gap: 6px;
+  }
+  .cg-thought, .cg-keepsake, .cg-spark {
+    display: flex; align-items: flex-start; gap: 9px; flex-wrap: wrap;
+    padding: 7px 10px;
+    border: var(--cg-stroke-width) solid var(--cg-border);
+    border-radius: var(--cg-radius);
+    background: color-mix(in srgb, var(--cg-fg) 3%, transparent);
+  }
+  .cg-thought-main, .cg-keepsake-main, .cg-spark-main {
+    flex: 1 1 220px; min-width: 0;
+    display: flex; flex-direction: column; gap: 3px;
+  }
+  .cg-thought-text, .cg-keepsake-text, .cg-spark-text {
+    font-size: 13px; color: var(--cg-fg); word-break: break-word;
+  }
+  /* 来源：念头必须让人看见「它是从哪句话长出来的」。这句是这套机制最要紧的
+     一条纪律在人眼里的样子——没有来源的念头就是凭空的判断。 */
+  .cg-thought-source {
+    font-size: 11.5px; color: var(--cg-muted);
+    border-left: 2px solid color-mix(in srgb, var(--cg-fg) 18%, transparent);
+    padding-left: 7px; word-break: break-word;
+  }
+  .cg-thought-meta, .cg-keepsake-meta, .cg-spark-meta {
+    font-size: 11.5px; color: var(--cg-muted); display: flex; gap: 8px; flex-wrap: wrap;
+  }
+  .cg-thought-act, .cg-keepsake-act { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+  .cg-badge.kind-thought { color: var(--cg-accent); border-color: color-mix(in srgb, var(--cg-accent) 45%, transparent); }
+  .cg-badge.kind-voiced { color: var(--cg-cat-open_loop); border-color: color-mix(in srgb, var(--cg-cat-open_loop) 45%, transparent); }
+  .cg-badge.kind-kept { color: var(--cg-cat-creative); border-color: color-mix(in srgb, var(--cg-cat-creative) 45%, transparent); }
+  .cg-badge.kind-released { color: var(--cg-muted); border-color: color-mix(in srgb, var(--cg-fg) 22%, transparent); }
+  .cg-badge.kind-triggered { color: var(--cg-cat-emotion); border-color: color-mix(in srgb, var(--cg-cat-emotion) 45%, transparent); }
+  .cg-badge.kind-skipped { color: var(--cg-muted); border-color: color-mix(in srgb, var(--cg-fg) 22%, transparent); }
+  .cg-thought-empty, .cg-keepsake-empty, .cg-spark-empty {
+    margin-top: 8px; color: var(--cg-muted); font-size: 12.5px;
+  }
+  /* 三块各自的说明文字。措辞要克制：这些都不是「待办清单」。 */
+  .cg-thought-tip, .cg-keepsake-tip, .cg-spark-tip {
+    margin: 8px 0 0; font-size: 11.5px; color: var(--cg-muted);
+  }
   /* 标签编辑器：标签是「XX的XX」这种关系化说法，用户可以随时改和删。
      之前只有「加一条备注」的输入框，加错了就删不掉，用户为此专门提过一次。 */
   .cg-tag-list { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; min-height: 22px; }
@@ -728,6 +774,60 @@
       <button class="cg-btn sm" id="cg-prev" type="button">上一页</button>
       <button class="cg-btn sm" id="cg-next" type="button">下一页</button>
       <span id="cg-pager-info"></span>
+    </div>
+  </div>
+
+  <div class="cg-panel cg-thoughts folded" id="cg-thoughts">
+    <div class="cg-panel-head">
+      <button class="cg-fold-hit" id="cg-thoughts-fold" type="button" aria-expanded="false" aria-controls="cg-thoughts-body">
+        <span class="cg-fold-caret"></span>
+        <span class="cg-panel-title">念头</span>
+      </button>
+      <span class="cg-panel-cap" id="cg-thoughts-cap"></span>
+    </div>
+    <div class="cg-panel-body" id="cg-thoughts-body">
+      <div class="cg-thought-empty" id="cg-thoughts-empty">正在读取念头…</div>
+      <div class="cg-thought-list" id="cg-thoughts-list" hidden></div>
+      <p class="cg-thought-tip" id="cg-thoughts-tip">
+        这些是她自己的想法，不是已经发生的事实。每一条都必须指回聊天记录里的某一句话——没有来源的念头在入库时就被丢掉了。<br>
+        她可以把念头说出来（会标成「说出口了」），也可以让它自己慢慢淡掉，两种都不算失败。
+      </p>
+    </div>
+  </div>
+
+  <div class="cg-panel cg-keepsakes folded" id="cg-keepsakes">
+    <div class="cg-panel-head">
+      <button class="cg-fold-hit" id="cg-keepsakes-fold" type="button" aria-expanded="false" aria-controls="cg-keepsakes-body">
+        <span class="cg-fold-caret"></span>
+        <span class="cg-panel-title">留念</span>
+      </button>
+      <span class="cg-panel-cap" id="cg-keepsakes-cap"></span>
+    </div>
+    <div class="cg-panel-body" id="cg-keepsakes-body">
+      <div class="cg-keepsake-empty" id="cg-keepsakes-empty">正在读取留念…</div>
+      <div class="cg-keepsake-list" id="cg-keepsakes-list" hidden></div>
+      <p class="cg-keepsake-tip" id="cg-keepsakes-tip">
+        她留着的没用的东西。这些不衰减、不进记忆、不参与任何排序——留下来的理由只有「她不想扔」。<br>
+        放满之后系统<strong>不会</strong>替她清理哪一件：要么她自己挑一件放掉，要么就一直放着。「放掉」是记录，不是删除。
+      </p>
+    </div>
+  </div>
+
+  <div class="cg-panel cg-sparks folded" id="cg-sparks">
+    <div class="cg-panel-head">
+      <button class="cg-fold-hit" id="cg-sparks-fold" type="button" aria-expanded="false" aria-controls="cg-sparks-body">
+        <span class="cg-fold-caret"></span>
+        <span class="cg-panel-title">主动</span>
+      </button>
+      <span class="cg-panel-cap" id="cg-sparks-cap"></span>
+    </div>
+    <div class="cg-panel-body" id="cg-sparks-body">
+      <div class="cg-spark-empty" id="cg-sparks-empty">正在读取主动记录…</div>
+      <div class="cg-spark-list" id="cg-sparks-list" hidden></div>
+      <p class="cg-spark-tip" id="cg-sparks-tip">
+        她自己想起来的时候做的事。她不能上网，所以能翻的只有自己记得的东西：没聊完的事、留着的留念、聊天记录里的某一段。<br>
+        这一栏连「没开口」也记下来并写明原因——主动功能出问题时，看得见的从来不是她说了什么，而是她为什么没说。
+      </p>
     </div>
   </div>
 
@@ -2489,6 +2589,241 @@
     });
   }
 
+  // ── 念头 / 留念 / 主动 ──
+  //
+  // 这三块都是「她自己想出来的东西」，和上面那些「查记忆」的面板性质不同：
+  // 记忆是记录，这些是她的倾向。所以三块一律默认折叠、都排在记忆下面，
+  // 也不做编辑——能改的只有「删掉」和「放掉」，改内容等于替她想。
+
+  function emptyBadge(cls) { return el('span', 'cg-badge ' + cls); }
+
+  function loadThoughts() {
+    var box = $('cg-thoughts-list');
+    var empty = $('cg-thoughts-empty');
+    var cap = $('cg-thoughts-cap');
+    if (!box) return Promise.resolve();
+    return M.query('thoughts', { limit: 60 }).then(function (res) {
+      if (!res || res.ok !== true) {
+        empty.textContent = '读取念头失败：' + ((res && res.error) || '未知错误');
+        empty.hidden = false;
+        box.hidden = true;
+        return;
+      }
+      var rows = res.thoughts || [];
+      if (cap) cap.textContent = '还惦记着 ' + rows.length + ' 件';
+      box.textContent = '';
+      if (!rows.length) {
+        // 空是常态，不能写得像出错。「大多数轮次不会有念头」是设计，不是故障。
+        empty.textContent = '她现在心里没有搁着的事。这也挺正常的——念头本来就该是偶尔才有。';
+        empty.hidden = false;
+        box.hidden = true;
+        return;
+      }
+      empty.hidden = true;
+      box.hidden = false;
+      rows.forEach(function (item) { box.appendChild(renderThought(item)); });
+    }).catch(function (err) {
+      empty.textContent = '读取念头失败：' + err;
+      empty.hidden = false;
+      box.hidden = true;
+    });
+  }
+
+  function renderThought(item) {
+    var row = el('div', 'cg-thought');
+    var main = el('div', 'cg-thought-main');
+
+    var head = el('div', 'cg-thought-meta');
+    var badge = emptyBadge(item.status === 'voiced' ? 'kind-voiced' : 'kind-thought');
+    badge.textContent = item.status_label || '还惦记着';
+    head.appendChild(badge);
+    if (item.session_label) head.appendChild(el('span', null, item.session_label));
+    main.appendChild(head);
+
+    main.appendChild(el('div', 'cg-thought-text', item.content));
+
+    // 来源永远显示。念头没有来源就只是猜测——用户要有能力一眼看出它是从
+    // 哪句话长出来的，否则这一整块就是「bot 在背后议论人」。
+    if (item.source_text) {
+      main.appendChild(el('div', 'cg-thought-source', '来自：' + item.source_text));
+    }
+
+    var meta = el('div', 'cg-thought-meta');
+    meta.appendChild(el('span', null, '显著度 ' + Number(item.salience || 0).toFixed(2)));
+    if (item.awaken_count) meta.appendChild(el('span', null, '被想起 ' + item.awaken_count + ' 次'));
+    meta.appendChild(el('span', null, fmtTime(item.created_at)));
+    main.appendChild(meta);
+    row.appendChild(main);
+
+    var act = el('div', 'cg-thought-act');
+    var del = el('button', 'cg-btn sm danger', '删掉');
+    del.type = 'button';
+    del.addEventListener('click', function () { deleteThought(item); });
+    act.appendChild(del);
+    row.appendChild(act);
+
+    return row;
+  }
+
+  function deleteThought(item) {
+    M.action('thought_delete', { thought_id: item.id }, true).then(function (res) {
+      if (!res || res.ok !== true) { fail(res, '删除失败'); return; }
+      toast('这件事从她心里拿走了', 'ok');
+      loadThoughts();
+    }).catch(function (err) { toast('删除失败：' + err, 'err'); });
+  }
+
+  function loadKeepsakes() {
+    var box = $('cg-keepsakes-list');
+    var empty = $('cg-keepsakes-empty');
+    var cap = $('cg-keepsakes-cap');
+    if (!box) return Promise.resolve();
+    return M.query('keepsakes', { limit: 200 }).then(function (res) {
+      if (!res || res.ok !== true) {
+        empty.textContent = '读取留念失败：' + ((res && res.error) || '未知错误');
+        empty.hidden = false;
+        box.hidden = true;
+        return;
+      }
+      var rows = res.keepsakes || [];
+      var kept = Number(res.kept || 0);
+      // 摘要只写「留了几件」，不写「已用 x/12」——后者会读成待办进度条，
+      // 而这一块刻意不是待办。所以 res.cap 也不显示。
+      if (cap) {
+        cap.textContent = kept ? '留着 ' + kept + ' 件' : '还没留下什么';
+      }
+      box.textContent = '';
+      if (!rows.length) {
+        empty.textContent = '她还没留下什么没用的东西。这种东西本来就少见——要真的觉得有意思，才会留着。';
+        empty.hidden = false;
+        box.hidden = true;
+        return;
+      }
+      empty.hidden = true;
+      box.hidden = false;
+      rows.forEach(function (item) { box.appendChild(renderKeepsake(item)); });
+    }).catch(function (err) {
+      empty.textContent = '读取留念失败：' + err;
+      empty.hidden = false;
+      box.hidden = true;
+    });
+  }
+
+  function renderKeepsake(item) {
+    var row = el('div', 'cg-keepsake');
+    var main = el('div', 'cg-keepsake-main');
+
+    var meta = el('div', 'cg-keepsake-meta');
+    var badge = emptyBadge(item.status === 'released' ? 'kind-released' : 'kind-kept');
+    badge.textContent = item.status_label || '还留着';
+    meta.appendChild(badge);
+    if (item.kind_label) meta.appendChild(el('span', null, item.kind_label));
+    if (item.session_label) meta.appendChild(el('span', null, item.session_label));
+    main.appendChild(meta);
+
+    main.appendChild(el('div', 'cg-keepsake-text', item.content));
+
+    var sub = el('div', 'cg-keepsake-meta');
+    sub.appendChild(el('span', null, fmtTime(item.created_at)));
+    if (item.status === 'released' && item.released_at) {
+      sub.appendChild(el('span', null, '放掉于 ' + fmtTime(item.released_at)));
+    }
+    main.appendChild(sub);
+    row.appendChild(main);
+
+    var act = el('div', 'cg-keepsake-act');
+    if (item.status !== 'released') {
+      var release = el('button', 'cg-btn sm', '放掉');
+      release.type = 'button';
+      release.addEventListener('click', function () { releaseKeepsake(item); });
+      act.appendChild(release);
+    }
+    var del = el('button', 'cg-btn sm danger', '删除');
+    del.type = 'button';
+    del.addEventListener('click', function () { deleteKeepsake(item); });
+    act.appendChild(del);
+    row.appendChild(act);
+
+    return row;
+  }
+
+  function releaseKeepsake(item) {
+    M.action('keepsake_release', { keepsake_id: item.id }, true).then(function (res) {
+      if (!res || res.ok !== true) { fail(res, '放掉失败'); return; }
+      toast('放掉了——记录还在，只是不再占她的位置', 'ok');
+      loadKeepsakes();
+    }).catch(function (err) { toast('放掉失败：' + err, 'err'); });
+  }
+
+  function deleteKeepsake(item) {
+    M.action('keepsake_delete', { keepsake_id: item.id }, true).then(function (res) {
+      if (!res || res.ok !== true) { fail(res, '删除失败'); return; }
+      toast('已彻底删掉', 'ok');
+      loadKeepsakes();
+    }).catch(function (err) { toast('删除失败：' + err, 'err'); });
+  }
+
+  function loadSparks() {
+    var box = $('cg-sparks-list');
+    var empty = $('cg-sparks-empty');
+    var cap = $('cg-sparks-cap');
+    if (!box) return Promise.resolve();
+    return M.query('sparks', { limit: 60 }).then(function (res) {
+      if (!res || res.ok !== true) {
+        empty.textContent = '读取主动记录失败：' + ((res && res.error) || '未知错误');
+        empty.hidden = false;
+        box.hidden = true;
+        return;
+      }
+      var rows = res.sparks || [];
+      var triggered = Number(res.triggered || 0);
+      var skipped = Number(res.skipped || 0);
+      if (cap) {
+        cap.textContent = triggered || skipped
+          ? '开口 ' + triggered + ' 次 / 没开口 ' + skipped + ' 次'
+          : '还没主动过';
+      }
+      box.textContent = '';
+      if (!rows.length) {
+        empty.textContent = '她还没有自己想起来做什么。这块默认是关的——打开之后她才会在空闲时翻翻自己的记忆。';
+        empty.hidden = false;
+        box.hidden = true;
+        return;
+      }
+      empty.hidden = true;
+      box.hidden = false;
+      rows.forEach(function (item) { box.appendChild(renderSpark(item)); });
+    }).catch(function (err) {
+      empty.textContent = '读取主动记录失败：' + err;
+      empty.hidden = false;
+      box.hidden = true;
+    });
+  }
+
+  function renderSpark(item) {
+    var row = el('div', 'cg-spark');
+    var main = el('div', 'cg-spark-main');
+
+    var meta = el('div', 'cg-spark-meta');
+    var badge = emptyBadge(item.status === 'triggered' ? 'kind-triggered' : 'kind-skipped');
+    badge.textContent = item.status_label || '没开口';
+    meta.appendChild(badge);
+    if (item.kind_label) meta.appendChild(el('span', null, item.kind_label));
+    if (item.session_label) meta.appendChild(el('span', null, item.session_label));
+    main.appendChild(meta);
+
+    if (item.content) main.appendChild(el('div', 'cg-spark-text', item.content));
+
+    var sub = el('div', 'cg-spark-meta');
+    // 没开口的原因照原样显示。这一列的用处就在这里：看得出她是被什么挡住的。
+    if (item.reason) sub.appendChild(el('span', null, item.reason));
+    sub.appendChild(el('span', null, fmtTime(item.created_at)));
+    main.appendChild(sub);
+    row.appendChild(main);
+
+    return row;
+  }
+
   // ── 事件绑定 ──
 
   // 注意：必须把 this 和参数转发给被延迟调用的函数。
@@ -2510,6 +2845,14 @@
     loadItems();
     loadStats();
     loadSessions();
+    // 刷新按钮要真的刷新整页。之前它只重载了记忆那三样，情绪/人物/喜好
+    // 停在旧数据上，用户点了刷新会以为「情绪没变」。
+    loadMood();
+    loadPeople();
+    loadPrefs();
+    loadThoughts();
+    loadKeepsakes();
+    loadSparks();
   }
 
   // 折叠一块面板。aria-expanded 要跟着改：屏幕阅读器靠它判断内容是否可见，
@@ -2532,6 +2875,15 @@
     });
     $('cg-prefs-fold').addEventListener('click', function () {
       toggleFold('cg-prefs', 'cg-prefs-fold', 'cg-prefs-body');
+    });
+    $('cg-thoughts-fold').addEventListener('click', function () {
+      toggleFold('cg-thoughts', 'cg-thoughts-fold', 'cg-thoughts-body');
+    });
+    $('cg-keepsakes-fold').addEventListener('click', function () {
+      toggleFold('cg-keepsakes', 'cg-keepsakes-fold', 'cg-keepsakes-body');
+    });
+    $('cg-sparks-fold').addEventListener('click', function () {
+      toggleFold('cg-sparks', 'cg-sparks-fold', 'cg-sparks-body');
     });
     $('cg-people-prev').addEventListener('click', function () {
       if (peopleState.offset <= 0) return;
@@ -2719,7 +3071,8 @@
         // 下拉框里仍可切回「全部状态」。
         fillSelect($('cg-f-status'), statusOptions, DEFAULT_STATUS_FILTER);
         state.filters.status = DEFAULT_STATUS_FILTER;
-        return loadMood().then(loadPeople).then(loadPrefs).then(loadItems);
+        return loadMood().then(loadPeople).then(loadPrefs).then(loadItems)
+          .then(loadThoughts).then(loadKeepsakes).then(loadSparks);
       });
     }).catch(function (err) {
       toast('初始化失败：' + err, 'err');

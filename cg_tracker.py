@@ -31,7 +31,15 @@ from .cg_backfill import (
 )
 from .cg_extract import format_transcript, frame_self_lines, run_extraction
 from .cg_guard import system_text_reason
-from .cg_history import describe_span, message_text, split_window, summarize_hole, to_history_rows
+from .cg_history import (
+    describe_span,
+    message_stamp,
+    message_text,
+    split_window,
+    summarize_hole,
+    to_history_rows,
+)
+from .cg_presence import offline_spans
 from .cg_person import (
     accumulate_impact,
     affection_from_axes,
@@ -130,6 +138,7 @@ class SessionTracker:
         log_extract_raw: bool = False,
         mood: Any = None,
         gate: Any = None,
+        online_windows_getter: Callable[[], list[Any]] | None = None,
     ) -> None:
         self._ctx = ctx
         self._store = store
@@ -143,6 +152,14 @@ class SessionTracker:
         #: replyer hook —— 因为精力耗尽后 Bot 不再回复，那个 hook 根本不会触发，
         #: 门控就永远等不到恢复的时机。
         self._gate = gate
+        #: 读「在线区间」的回调（由 ``plugin.py`` 提供，读的是它那份内存缓存）。
+        #:
+        #: 为什么要回调而不是自己查：在线时段是宿主 ``online_time`` 表的
+        #: 8600 行聚合，插件侧已经有一个后台任务每 10 分钟刷一次，这里再查
+        #: 一遍纯属重复；更要紧的是**两边必须用同一份数据**——否则「补抓算出的
+        #: 离线区间」和「注入时算的缺席感」会对不上，同一段时间一边说「她那会儿
+        #: 不在」一边说「她一直在等」。
+        self._online_windows_getter = online_windows_getter
         #: 机器人自身的账号 ID 集合。从「全量消息 vs filter_mai 消息」的差集
         #: 里学习得到，再并上配置 ``[people] self_identities``。用途只有一个：
         #: **不把她自己当成聊天里的「别人」记进人物表**。
@@ -596,7 +613,13 @@ class SessionTracker:
         # 「那会儿我不在」。
         _state = self._store.get_state(entry.session_id) or {}
         _last_extract = float(_state.get("last_extract_ts") or 0.0)
-        window, hole = split_window(messages, max_msgs, since_ts=_last_extract)
+        offline = self._offline_spans(messages, since_ts=_last_extract)
+        window, hole = split_window(
+            messages,
+            max_msgs,
+            since_ts=_last_extract,
+            offline_spans=offline,
+        )
         if hole:
             await self._record_hole(entry, hole)
 
@@ -644,6 +667,9 @@ class SessionTracker:
         prefs_enabled = self._prefs_enabled()
         known_prefs = self._known_prefs() if prefs_enabled else ()
 
+        # 留念也搭车：同一份聊天记录，多问一句「有没有什么没用的东西想留着」。
+        keepsake_enabled = self._keepsake_enabled()
+
         result = await run_extraction(
             self._ctx.llm,
             transcript=transcript,
@@ -664,6 +690,7 @@ class SessionTracker:
             known_prefs=known_prefs,
             role_hints=role_hints,
             roles=role_table,
+            keepsake_enabled=keepsake_enabled,
         )
 
         # 空回复在小模型上是高频瞬时问题（宿主自己也会重试），这里补一次重试。
@@ -694,6 +721,7 @@ class SessionTracker:
                 known_prefs=known_prefs,
                 role_hints=role_hints,
                 roles=role_table,
+                keepsake_enabled=keepsake_enabled,
             )
 
         written = 0
@@ -701,6 +729,7 @@ class SessionTracker:
         people_written = 0
         prefs_written = 0
         thoughts_written = 0
+        keepsakes_written = 0
         if result.ok:
             resolved_count = self._apply_resolved(entry.session_id, result.resolved)
             written = self._apply_items(entry.session_id, result.items)
@@ -710,6 +739,7 @@ class SessionTracker:
             if prefs_enabled:
                 prefs_written = self._apply_prefs(result.prefs)
             thoughts_written = self._apply_thoughts(entry.session_id, result.thoughts)
+            keepsakes_written = self._apply_keepsakes(entry.session_id, result.keepsakes)
 
         try:
             self._store.record_extraction(
@@ -730,9 +760,11 @@ class SessionTracker:
         else:
             people_note = f", 人物 {people_written} 条" if people_written else ""
             thought_note = f", 念头 {thoughts_written} 条" if thoughts_written else ""
+            keep_note = f", 留念 {keepsakes_written} 件" if keepsakes_written else ""
             self._info(
                 f"会话 {entry.session_id} 抽取完成: 新增/合并 {written} 条, "
-                f"解决 {resolved_count} 条{people_note}{thought_note}, 模型={result.model or '?'}"
+                f"解决 {resolved_count} 条{people_note}{thought_note}{keep_note}, "
+                f"模型={result.model or '?'}"
             )
         if self._log_extract_raw and result.raw_response:
             self._debug(f"会话 {entry.session_id} 模型原始返回:\n{result.raw_response[:2000]}")
@@ -1041,6 +1073,21 @@ class SessionTracker:
             return False
         return bool(getattr(prefs, "enabled", False))
 
+    def _keepsake_enabled(self) -> bool:
+        """抽取时要不要问一句「有没有什么没用的东西想留着」。
+
+        它和 ``keepsake.enabled`` 不是同一件事：``enabled`` 管的是「能不能留」，
+        这个 ``extract_hint`` 管的是「要不要主动去问她」。关掉提示仍然可以在
+        WebUI 里手动加——但那样就永远不会自己收下任何东西了。
+        """
+
+        keep = getattr(self._config(), "keepsake", None)
+        if keep is None:
+            return False
+        if not bool(getattr(keep, "enabled", True)):
+            return False
+        return bool(getattr(keep, "extract_hint", True))
+
     def _known_prefs(self) -> list[str]:
         """列出已有的口味，让模型只补充、不重复。"""
 
@@ -1201,6 +1248,54 @@ class SessionTracker:
             self._store.trim_thoughts(session_id, keep=40)
         except Exception as exc:  # noqa: BLE001
             self._warn(f"trim_thoughts 失败: {exc!r}")
+        return written
+
+    def _apply_keepsakes(self, session_id: str, keepsakes: list[dict[str, Any]]) -> int:
+        """把抽取出来的留念写进 ``gap_keepsakes``。
+
+        三条和别处不同的规则，都是刻意的：
+
+        1. **不查来源。** 念头必须能指回一句原文，留念不需要——一样没用的东西
+           不该被要求证明自己从哪来。
+        2. **满了就不再收。** 不收也不删旧的：满了之后 ``is_full`` 为真，由
+           ``_keepsake_overflow_note`` 让她自己想「要不要放掉一个」。系统永远
+           不替她决定扔哪一条。
+        3. **不参与衰减、不参与注入。** 这里只写表，没有任何地方会把它读进
+           提示词（除非「主动」把它当成开口的由头）。
+        """
+
+        config = self._config()
+        keep_cfg = getattr(config, "keepsake", None)
+        if keep_cfg is not None and not bool(getattr(keep_cfg, "enabled", True)):
+            return 0
+        if not keepsakes:
+            return 0
+
+        cap = int(getattr(keep_cfg, "max_items", 12) or 12)
+        now = time.time()
+        written = 0
+        for entry in keepsakes:
+            content = str(entry.get("content") or "").strip()
+            if not content:
+                continue
+            dirty = system_text_reason(content)
+            if dirty:
+                self._warn(f"丢弃疑似系统文本的留念（{dirty}）: {content[:120]}")
+                continue
+            try:
+                if self._store.keep_count(session_id) >= max(1, cap):
+                    self._debug(f"留念已满（{cap} 件），这一件先不收：{content[:60]}")
+                    break
+                self._store.add_keepsake(
+                    session_id,
+                    content=content,
+                    kind=str(entry.get("kind") or "line"),
+                    source_text="",
+                    now=now,
+                )
+                written += 1
+            except Exception as exc:  # noqa: BLE001
+                self._warn(f"add_keepsake 失败: {exc!r}")
         return written
 
     def _apply_resolved(self, session_id: str, resolved: list[str]) -> int:
@@ -1383,6 +1478,56 @@ class SessionTracker:
                 self._debug(f"学习机器人账号失败（不影响抽取）: {exc!r}")
 
         return messages
+
+    def _offline_spans(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        since_ts: float,
+    ) -> list[tuple[float, float]]:
+        """算出「这批消息里，哪些时间她根本不在线」。
+
+        这是补抓路径上「洞」判定的补丁。原来的判据只有一条：**超出读窗口的
+        部分**。真机上那条判据从来没生效过——补抓回来 20 条，全塞进 30 条的
+        窗口，洞是空的，``gap_unread`` 一直 0 行。于是她读完那 20 条就像从头
+        到尾都在场，而其中一半是她关机期间别人说的话。
+
+        现在改成看**时间戳**：落在她离线区间里的消息，不管在不在窗口内，都是
+        她没看见的。读窗口也把这几条扣掉——告诉她「这 10 条你一条都没看到」
+        又把它们塞进读窗口，等于自相矛盾。
+
+        拿不到在线数据时返回空列表，行为与旧版完全一致。理由和
+        :func:`cg_presence.offline_spans` 一样：**不知道 ≠ 不在**。
+        """
+
+        if not messages:
+            return []
+        getter = self._online_windows_getter
+        if getter is None:
+            return []
+        try:
+            windows = getter()
+        except Exception as exc:  # noqa: BLE001 - 拿不到就退回旧判据
+            self._debug(f"读取在线区间失败（洞判据退回旧算法）: {exc!r}")
+            return []
+        if not windows:
+            return []
+
+        stamps = [message_stamp(item) for item in messages]
+        stamps = [value for value in stamps if value > 0]
+        if not stamps:
+            return []
+
+        # 区间上界用现在：她可能到现在还没回来，那段也是「不在」。
+        try:
+            return offline_spans(
+                windows,
+                start_ts=min(stamps),
+                end_ts=time.time(),
+            )
+        except Exception as exc:  # noqa: BLE001 - 算不出来就退回旧判据
+            self._debug(f"换算离线区间失败（洞判据退回旧算法）: {exc!r}")
+            return []
 
     async def _backfill(
         self,

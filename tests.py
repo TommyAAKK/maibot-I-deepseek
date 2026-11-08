@@ -157,6 +157,8 @@ log_mod = importlib.import_module(f"{_PKG_NAME}.cg_log")
 tracker_mod = importlib.import_module(f"{_PKG_NAME}.cg_tracker")
 thought_mod = importlib.import_module(f"{_PKG_NAME}.cg_thought")
 dissent_mod = importlib.import_module(f"{_PKG_NAME}.cg_dissent")
+keepsake_mod = importlib.import_module(f"{_PKG_NAME}.cg_keepsake")
+proactive_mod = importlib.import_module(f"{_PKG_NAME}.cg_proactive")
 AvoidanceProfile = avoidance_mod.AvoidanceProfile
 CompanionGapConfig = config_mod.CompanionGapConfig
 
@@ -3189,6 +3191,74 @@ async def test_webui(tmp: str) -> None:
     broken_stats = await broken.mem_stats()
     check(broken_stats["ok"] is False and "尚未初始化" in broken_stats["error"], "存储未初始化时返回错误而非崩溃")
 
+    # ── 念头 / 留念 / 主动三个面板的数据源（第 57 轮要求补的）──
+    # 这三块和前面对「记忆」的增删改不同：它们是**她自己的倾向**，页面只
+    # 负责展示和「拿走」，不提供编辑（改内容等于替她想）。
+    _panel_now = time.time()
+    _tid = store.add_thought(
+        "s1",
+        content="他说一周看完两部《沙丘》，我有点不信这个速度",
+        source_kind="history",
+        source_text="我上周把两部连着看完了",
+        salience=0.8,
+        expires_at=_panel_now + 7200.0,
+        now=_panel_now,
+    )
+    store.add_keepsake("s1", content="他说「量子缝补」这个词", kind="line", now=_panel_now)
+    store.record_spark(
+        "s1", kind="unfinished", content="周末一起看那部电影",
+        source="open_loop", status="skipped", reason="聊天还在进行，不算空闲", now=_panel_now,
+    )
+
+    thoughts = await admin.mem_thoughts()
+    check(thoughts["ok"] is True, "mem_thoughts 成功")
+    check(thoughts["total"] == 1, "念头列表一条")
+    _thought_item = thoughts["thoughts"][0]
+    check(_thought_item["id"] == _tid, "念头 id 对得上")
+    check(_thought_item["content"].startswith("他说一周看完"), "念头正文原样返回")
+    # 来源必须原样带给页面：这条是她「不是在背后议论人」的唯一可见证据
+    check(_thought_item["source_text"] == "我上周把两部连着看完了", "念头带来源原文")
+    check(_thought_item["status_label"] == "还惦记着", "活念头的中文状态")
+    check(_thought_item["session_label"] == "测试群", "念头带会话标签（跨会话汇总时要能认出是哪）")
+    check((await admin.mem_thoughts(status="bogus"))["ok"] is False, "未知念头状态报错而不是静默返回空")
+
+    # 说出口 != 删掉：voiced 仍然查得到（在 voiced 筛选下），默认视角看不到
+    store.voice_thought(_tid, now=_panel_now)
+    check((await admin.mem_thoughts())["total"] == 0, "说出口的念头不在默认视角里")
+    _voiced = await admin.mem_thoughts(status="voiced")
+    check(_voiced["total"] == 1 and _voiced["thoughts"][0]["status_label"] == "说出口了", "voiced 筛选下还看得见")
+    _gone = await admin.mem_thought_delete(thought_id=_tid)
+    check(_gone["ok"] is True, "删念头成功")
+    check((await admin.mem_thoughts(status="voiced"))["total"] == 0, "删掉之后彻底没了")
+    check((await admin.mem_thought_delete(thought_id=_tid))["ok"] is False, "重复删念头报错")
+
+    keepsakes = await admin.mem_keepsakes()
+    check(keepsakes["ok"] is True, "mem_keepsakes 成功")
+    check(keepsakes["kept"] == 1 and keepsakes["released"] == 0, "留念计数分开算 kept / released")
+    check(keepsakes["cap"] == 12, "留念带上限（页面侧刻意不显示，但接口要给）")
+    _keep = keepsakes["keepsakes"][0]
+    check(_keep["kind_label"] == "一句话", "留念类别有中文标签")
+    check(_keep["session_label"] == "测试群", "留念带会话标签")
+    # 放掉是记录不是删除：放进 released，仍然查得到，还带放掉时间
+    _released = await admin.mem_keepsake_release(keepsake_id=_keep["id"])
+    check(_released["ok"] is True, "放掉留念成功")
+    check((await admin.mem_keepsakes())["kept"] == 0, "放掉之后不再占她的位置")
+    _rel_rows = (await admin.mem_keepsakes(status="released"))["keepsakes"]
+    check(len(_rel_rows) == 1 and _rel_rows[0]["released_at"] > 0, "放掉的留念还留着放掉时间")
+    check(_rel_rows[0]["status_label"] == "放掉了", "放掉的中文状态")
+    check((await admin.mem_keepsake_release(keepsake_id=_keep["id"]))["ok"] is False, "重复放掉报错")
+    check((await admin.mem_keepsake_delete(keepsake_id=_keep["id"]))["ok"] is True, "彻底删掉留念成功")
+    check((await admin.mem_keepsakes(status="released"))["total"] == 0, "彻底删掉之后连记录都没了")
+
+    sparks = await admin.mem_sparks()
+    check(sparks["ok"] is True, "mem_sparks 成功")
+    check(sparks["total"] == 1 and sparks["skipped"] == 1 and sparks["triggered"] == 0, "主动计数分开算开口/没开口")
+    _spark = sparks["sparks"][0]
+    # 这一列的用处就在这里：只显示成功的话，出问题时永远看不出是没触发还是被挡
+    check(_spark["reason"] == "聊天还在进行，不算空闲", "没开口的原因原样带给页面")
+    check(_spark["status_label"] == "没开口", "没开口的中文状态")
+    check(_spark["session_label"] == "测试群", "主动记账带会话标签")
+
     # ── webui.json 与代码的一致性（不依赖宿主）──
     declaration_path = os.path.join(_HERE, "webui.json")
     with open(declaration_path, encoding="utf-8") as handle:
@@ -3256,6 +3326,8 @@ def test_config() -> None:
         "initiative",
         "history",
         "thought",
+        "keepsake",
+        "proactive",
         "debug",
     )
 
@@ -3282,7 +3354,7 @@ def test_config() -> None:
                 missing_label.append(f"[{section}].{name}")
             if not hint or not has_cjk(hint):
                 missing_hint.append(f"[{section}].{name}")
-    check(total == 179, f"{len(sections)} 个节共 179 个配置项（实际 {total}）")
+    check(total == 192, f"{len(sections)} 个节共 192 个配置项（实际 {total}）")
     check(not missing_label, f"每个配置项都有中文 label（缺 {missing_label}）")
     check(not missing_hint, f"每个配置项都有中文 hint（缺 {missing_hint}）")
 
@@ -5213,6 +5285,54 @@ def test_presence() -> None:
         "「此刻在线」的判定也要有容差",
     )
 
+    # ── 离线区间：洞判据的输入 ──
+    #
+    # 这一组是补抓路径那个 bug 的补丁。判据从「超出读窗口的部分」换成
+    # 「时间戳落在她离线区间里的消息」，所以区间的算法必须单独钉住。
+    _d = lambda h, m=0: base + timedelta(hours=h, minutes=m)
+    _two = [(_d(0), _d(1)), (_d(3), _d(4))]  # 在线 0-1、3-4，那么 1-3 是离线
+    _spans = presence_mod.offline_spans(_two, start_ts=_d(0).timestamp(), end_ts=_d(5).timestamp())
+    check(len(_spans) == 2, "两段在线之间 + 末尾敞口，各算一段离线")
+    check(
+        abs(_spans[0][0] - _d(1).timestamp()) < 1 and abs(_spans[0][1] - _d(3).timestamp()) < 1,
+        "中间那段离线正好是两段在线之间的空档",
+    )
+    check(
+        abs(_spans[1][0] - _d(4).timestamp()) < 1,
+        "末尾敞口从最后一段在线结束算起",
+    )
+    check(
+        all(e > s for s, e in _spans), "不会有零长度或倒序的区间"
+    )
+    check(
+        presence_mod.offline_spans([], start_ts=0, end_ts=100) == [],
+        "没有在线数据就返回空（不知道 ≠ 不在）",
+    )
+    check(
+        presence_mod.offline_spans(
+            [(_d(5), _d(6))], start_ts=_d(0).timestamp(), end_ts=_d(5, 30).timestamp()
+        )
+        == [],
+        "**第一段在线之前的时间不算离线**（online_time 只留 30 天，之前是「不知道」）",
+    )
+    _short = presence_mod.offline_spans(
+        [(_d(0), _d(1)), (_d(1, 3), _d(4))],
+        start_ts=_d(0).timestamp(),
+        end_ts=_d(4).timestamp(),
+    )
+    check(_short == [], "三分钟的小空档不算离线（进程重启不是缺席）")
+    check(
+        presence_mod.MIN_OFFLINE_SECONDS >= 300,
+        "离线判定的最短时长不能太短，否则每个重启都被当成她不在",
+    )
+    _tail = presence_mod.offline_spans(
+        [(_d(0), _d(1))], start_ts=_d(0).timestamp(), end_ts=_d(10).timestamp()
+    )
+    check(
+        len(_tail) == 1 and abs(_tail[0][1] - _d(10).timestamp()) < 1,
+        "最后一段在线之后到现在也是离线（关机一整夜的形状）",
+    )
+
 
 def test_initiative() -> None:
     """自主发言闸门：兴趣 / 好感度 / 心情 加权，硬过滤优先。
@@ -5811,6 +5931,52 @@ def test_history() -> None:
     check(history_mod.split_window(msgs, 0)[0] == [], "max_read=0 时窗口为空")
     check(history_mod.split_window([], 3) == ([], []), "空输入返回两个空列表")
 
+    # ── L1 补丁：离线时段里的消息，不管在不在窗口内都是洞 ──
+    #
+    # 原来只有一条判据「超出读窗口的部分」。真机上它从来没生效过：补抓回来
+    # 20 条全塞进 30 条的窗口，洞是空的、gap_unread 一直 0 行，于是她读完那
+    # 20 条就像从头到尾都在场——而那 20 条里有一半是她关机期间别人说的话。
+    _hb = 1_800_000_000.0
+    _span_msgs = [
+        {"message_id": f"s{i}", "timestamp": str(_hb + i * 60), "processed_plain_text": f"第{i}条"}
+        for i in range(20)
+    ]
+    _offline = [(_hb + 300.0, _hb + 900.0)]
+    _w_old, _h_old = history_mod.split_window(_span_msgs, 30)
+    check(len(_h_old) == 0, "旧判据下这批消息全在窗口里，洞是空的（正是那个 bug）")
+    _w_new, _h_new = history_mod.split_window(
+        _span_msgs, 30, offline_spans=_offline
+    )
+    check(len(_h_new) == 11, "离线时段里的 11 条全部记成洞")
+    check(
+        not [m for m in _w_new if history_mod.in_spans(history_mod.message_stamp(m), _offline)],
+        "**落到洞里的消息必须从读窗口里拿掉**（两边都知道等于自相矛盾）",
+    )
+    _hole_stamps = [history_mod.message_stamp(m) for m in _h_new]
+    check(_hole_stamps == sorted(_hole_stamps), "洞按时间升序（否则「06:42 到 10:47」会被说反）")
+    check(
+        history_mod.in_spans(_hb + 300.0, _offline) and history_mod.in_spans(_hb + 900.0, _offline),
+        "区间两端都算在里面",
+    )
+    check(
+        not history_mod.in_spans(_hb + 901.0, _offline) and not history_mod.in_spans(0, _offline),
+        "区间外、以及没有时间戳的都不算",
+    )
+    _w_e, _h_e = history_mod.split_window(_span_msgs, 30, offline_spans=[])
+    check(
+        (len(_w_e), len(_h_e)) == (20, 0),
+        "**没有在线数据时行为必须和旧版完全一致**（不知道 ≠ 不在）",
+    )
+    _w_n, _h_n = history_mod.split_window(_span_msgs, 30, offline_spans=None)
+    check((len(_w_n), len(_h_n)) == (20, 0), "offline_spans=None 与旧版一致")
+    _w_f, _h_f = history_mod.split_window(
+        _span_msgs, 30, since_ts=_hb + 400.0, offline_spans=_offline
+    )
+    check(
+        all(history_mod.message_stamp(m) > _hb + 400.0 for m in _h_f),
+        "上次抽取之前的不算本次的洞（离线判据也不能把老账翻出来）",
+    )
+
     # ── L1 摘要：只有条数和时间 ──
     summary = history_mod.summarize_hole(hole)
     check(summary is not None, "能从洞里算出摘要")
@@ -6277,10 +6443,284 @@ def test_dissent() -> None:
     )
 
 
+def test_keepsake() -> None:
+    """[20] 留念（浪费）。
+
+    用户的原话：「留一样完全没用的东西……人身上最有生命气息的部分，或许并不
+    是单纯的喜怒哀乐，而是在这些不产生价值，看似毫无意义的地方。」
+
+    这一节守的是**规则的方向**，不是数值：留念不衰减、满了不自动清理、
+    提醒里不给建议也不列清单。任何一条破掉，这个功能就退化成收藏夹。
+    """
+
+    print("[20] 留念")
+
+    import inspect
+
+    # ── 事实的防线：留念模块里不能有任何「有用化」的接口 ──
+    # 一旦存在 render_* 往 replyer 注入的用户内容，它就立刻变成有用的信息。
+    # 唯一允许的渲染是「满了」这个状态提醒，它不含任何一条留念的正文。
+    #
+    # 注意：不能直接 grep 源码里有没有 "decay" 这个词——docstring 里正大光明地
+    # 解释「为什么不用 decay_salience 那一套」。要查的是有没有**定义**这样的函数。
+    functions = {
+        name
+        for name, value in vars(keepsake_mod).items()
+        if inspect.isfunction(value) and not name.startswith("__")
+    }
+    check(
+        "render_mention_hint" in functions,
+        "mention 提示存在（主动开口用），但它不属于自动注入路径",
+    )
+    for banned in ("decay", "trim", "prune", "expire"):
+        check(
+            not any(banned in name for name in functions),
+            f"留念模块里没有 {banned} 类函数 —— 它不参与显著度那套规则，也不自动淘汰",
+        )
+
+    # ── 满了的状态 ──
+    many = [
+        keepsake_mod.Keepsake(id=index, content=f"第{index}件")
+        for index in range(1, keepsake_mod.MAX_ITEMS + 1)
+    ]
+    check(not keepsake_mod.is_full(many[:-1]), "差一件时还不算满")
+    check(keepsake_mod.is_full(many), f"留满 {keepsake_mod.MAX_ITEMS} 件算满")
+    check(
+        len(keepsake_mod.kept(many)) == keepsake_mod.MAX_ITEMS,
+        "kept() 只数还留着的",
+    )
+
+    released = keepsake_mod.Keepsake(
+        id=99,
+        content="放掉的",
+        status=keepsake_mod.STATUS_RELEASED,
+    )
+    check(len(keepsake_mod.kept(many + [released])) == keepsake_mod.MAX_ITEMS, "放掉的不算在占用里")
+
+    # ── 满了的提醒：说状态，不说该怎么办，也不列清单 ──
+    note = keepsake_mod.render_overflow_note(20, cap=12)
+    check(note != "", "满了要有提醒")
+    check("放不下" in note, "提醒说的是「放不下」这个状态")
+    check("第1件" not in note and "第12件" not in note, "提醒里不列出具体是哪几件")
+    check("建议" not in note, "提醒里不给建议（放掉哪条是她自己的决定）")
+    check(
+        keepsake_mod.render_overflow_note(3, cap=12) == "",
+        "没满就一句话都不说（一样没用的东西不该每轮占位置）",
+    )
+
+    # ── 「没什么用」这个措辞是必须的 ──
+    hint = keepsake_mod.render_mention_hint(keepsake_mod.Keepsake(id=1, content="量子缝补"))
+    check("没什么用" in hint, "提到它的时候必须说「没什么用」")
+    check("重要" not in hint, "不能说它「重要」——一说重要，模型就会给它编意义")
+    check(
+        keepsake_mod.render_mention_hint(keepsake_mod.Keepsake(id=2, content="")) == "",
+        "空内容不渲染",
+    )
+
+    # ── 数据视图 ──
+    item = keepsake_mod.Keepsake.from_row(
+        {"id": 7, "session_id": "s", "kind": "thing", "content": "  一张  没用的图  "}
+    )
+    check(item.kind == "thing", "kind 保留")
+    check(item.content == "一张 没用的图", "内容压掉多余空白")
+    check(
+        keepsake_mod.Keepsake.from_row({"kind": "???"}).kind == keepsake_mod.KIND_LINE,
+        "未知 kind 归到 line（不认识的类型不该一路传到 WebUI）",
+    )
+    check(keepsake_mod.describe_keepsake(item) != "", "describe_keepsake 能给出可读结论")
+
+    # ── 反向断言：上限和小节都必须还小 ──
+    check(keepsake_mod.MAX_ITEMS <= 60, "上限别调成几千——那就不是「留几件」了")
+    check(
+        not hasattr(keepsake_mod, "render_block"),
+        "留念**不能**有给 replyer 用的 render_block（那会让它变成有用信息）",
+    )
+
+
+def test_proactive() -> None:
+    """[21] 主动（好奇心）。
+
+    用户的原话：「在没有任何预设目标或指令的情况下，仅仅因为『好奇』或
+    『觉得有趣』，就去主动做一件完全没有人告诉过她或让她去做的事情。」
+
+    这一节守三件事：①硬闸的顺序里**不能有精力和深夜以外的「她做不到」理由**，
+    而且每次跳过都要有可读原因；②intent 必须是状态不是命令（写成命令就等于
+    替她做了决定）；③默认关。
+    """
+
+    print("[21] 主动")
+
+    import inspect
+
+    # ── 默认关 ──
+    check(proactive_mod.DEFAULT_DAILY_LIMIT == 1, "第一版默认每天 1 次")
+    check(proactive_mod.DEFAULT_COOLDOWN_HOURS >= 4.0, "冷却至少 4 小时")
+    check(proactive_mod.DEFAULT_IDLE_MINUTES >= 60.0, "空闲门槛至少 1 小时")
+
+    # ── 硬闸：每条拒绝都必须给出原因 ──
+    check(
+        proactive_mod.decide(enabled=False).reason == proactive_mod.REASON_DISABLED,
+        "开关关着就有原因",
+    )
+    check(
+        proactive_mod.decide(enabled=True, has_material=False).reason
+        == proactive_mod.REASON_NO_MATERIAL,
+        "没有素材也有原因",
+    )
+    check(
+        proactive_mod.decide(enabled=True, exhausted=True).reason
+        == proactive_mod.REASON_EXHAUSTED,
+        "精力耗尽也有原因",
+    )
+    check(
+        proactive_mod.decide(enabled=True, quiet=True).reason == proactive_mod.REASON_QUIET,
+        "深夜也有原因",
+    )
+    check(
+        proactive_mod.decide(enabled=True, idle=10.0).reason
+        == proactive_mod.REASON_NOT_IDLE,
+        "没闲下来也有原因",
+    )
+    barely = proactive_mod.decide(
+        enabled=True,
+        idle=proactive_mod.DEFAULT_IDLE_MINUTES * 60.0 + 1.0,
+        last_spark_ts=1000.0,
+        cooldown_seconds=99999.0,
+        now=2000.0,
+    )
+    check(barely.reason == proactive_mod.REASON_COOLDOWN, "冷却中也有原因")
+    limit = proactive_mod.decide(
+        enabled=True,
+        idle=proactive_mod.DEFAULT_IDLE_MINUTES * 60.0 + 1.0,
+        today_count=1,
+        daily_limit=1,
+    )
+    check(limit.reason == proactive_mod.REASON_DAILY_LIMIT, "额度用完也有原因")
+    ok = proactive_mod.decide(
+        enabled=True,
+        idle=proactive_mod.DEFAULT_IDLE_MINUTES * 60.0 + 1.0,
+        last_spark_ts=0.0,
+        today_count=0,
+    )
+    check(ok.allow, "条件都满足就放行")
+    check(ok.reason == proactive_mod.REASON_OK, "放行也有原因")
+
+    # 每一个原因的文案都必须可读（不能是英文常量名直接漏到日志）
+    for reason in (
+        proactive_mod.REASON_DISABLED,
+        proactive_mod.REASON_NO_MATERIAL,
+        proactive_mod.REASON_COOLDOWN,
+        proactive_mod.REASON_DAILY_LIMIT,
+        proactive_mod.REASON_EXHAUSTED,
+        proactive_mod.REASON_QUIET,
+        proactive_mod.REASON_NOT_IDLE,
+        proactive_mod.REASON_BOUNDARY,
+    ):
+        check(
+            any("\u4e00" <= ch <= "\u9fff" for ch in reason),
+            f"跳过原因必须是中文可读：{reason}",
+        )
+
+    # ── 免打扰时段 ──
+    import time as _time
+
+    def at_hour(hour: int) -> float:
+        stamp = _time.localtime()
+        return _time.mktime(
+            (stamp.tm_year, stamp.tm_mon, stamp.tm_mday, hour, 30, 0, 0, 0, -1)
+        )
+
+    check(proactive_mod.in_quiet_hours(at_hour(3), start=0, end=8), "凌晨 3 点在免打扰里")
+    check(not proactive_mod.in_quiet_hours(at_hour(15), start=0, end=8), "下午 3 点不在")
+    check(
+        proactive_mod.in_quiet_hours(at_hour(23), start=23, end=7),
+        "跨零点：23 点算免打扰",
+    )
+    check(
+        proactive_mod.in_quiet_hours(at_hour(2), start=23, end=7),
+        "跨零点：凌晨 2 点算免打扰",
+    )
+    check(
+        not proactive_mod.in_quiet_hours(at_hour(12), start=23, end=7),
+        "跨零点：中午不在",
+    )
+    check(
+        not proactive_mod.in_quiet_hours(at_hour(3), start=8, end=8),
+        "起止相同表示没有免打扰时段",
+    )
+
+    # ── intent 必须是状态，不能是命令 ──
+    for kind in proactive_mod.KINDS:
+        spark = proactive_mod.Spark(kind=kind, content="他说「量子缝补」这个词")
+        intent = proactive_mod.render_intent(spark)
+        check(intent != "", f"{kind} 的 intent 不是空")
+        check(
+            "你该" not in intent and "去跟" not in intent and "必须" not in intent,
+            f"{kind} 的 intent 里没有命令句式（写成命令就等于替她决定了）",
+        )
+        check(
+            "自行决定" not in intent,
+            f"{kind} 的 intent 不重复宿主那句「自行决定」（宿主自己会补）",
+        )
+    check(
+        proactive_mod.render_intent(proactive_mod.Spark(kind="revisit", content="")) == "",
+        "空内容渲染成空串（没有素材就不要 arm 一轮）",
+    )
+    check(
+        "没听明白" in proactive_mod.render_intent(
+            proactive_mod.Spark(kind=proactive_mod.KIND_REVISIT, content="某句话")
+        ),
+        "回去翻一段的措辞里点出「当时没听明白」——这是真好奇的形态",
+    )
+
+    # ── 由头挑选 ──
+    sparks = [
+        proactive_mod.Spark(kind=proactive_mod.KIND_UNFINISHED, content="没聊完的事"),
+        proactive_mod.Spark(kind=proactive_mod.KIND_KEEPSAKE, content="留着的东西"),
+    ]
+    picked = proactive_mod.pick_spark(sparks)
+    check(picked is not None and picked.kind == proactive_mod.KIND_UNFINISHED, "默认偏爱「没聊完的事」")
+    picked2 = proactive_mod.pick_spark(
+        sparks, prefer=[proactive_mod.KIND_KEEPSAKE]
+    )
+    check(
+        picked2 is not None and picked2.kind == proactive_mod.KIND_KEEPSAKE,
+        "prefer 能改顺序",
+    )
+    check(proactive_mod.pick_spark([]) is None, "没有候选返回 None")
+    check(
+        proactive_mod.pick_spark([proactive_mod.Spark(kind="revisit", content="   ")]) is None,
+        "空内容的候选不算候选",
+    )
+
+    # ── 从历史行造由头 ──
+    made = proactive_mod.spark_from_history(
+        [{"message_id": "m1", "text": "这句我当时没听懂"}, {"message_id": "m2", "text": ""}],
+        limit=3,
+    )
+    check(len(made) == 1, "跳过空正文的行")
+    check(made[0].kind == proactive_mod.KIND_REVISIT, "来源是「回去翻一段」")
+    check(
+        len(proactive_mod.spark_from_history([{"message_id": str(i), "text": "x"} for i in range(9)], limit=2))
+        == 2,
+        "limit 生效（一次只翻一条，不读整段）",
+    )
+
+    # ── describe_plan 永远带原因 ──
+    check(
+        "没开口" in proactive_mod.describe_plan(proactive_mod.decide(enabled=False)),
+        "describe_plan 对「没开口」也要给原因",
+    )
+
+    # ── 反向断言：当场信号/主动判定里不看精力以外的「她做不到」因素 ──
+    decide_src = inspect.getsource(proactive_mod.decide)
+    check("tired" not in decide_src, "没有额外的「累」判据（精力已经有一条）")
+    check("weekend" not in decide_src, "没有星期几这类莫名其妙的限制")
+
+
 # ── 主流程 ──
 
-async def main() -> None:
-    # 用 mkdtemp 而非 TemporaryDirectory：后者的 __exit__ 早于 finally 执行，
+async def main() -> None:    # 用 mkdtemp 而非 TemporaryDirectory：后者的 __exit__ 早于 finally 执行，
     # Windows 上 SQLite 文件还没关就删目录会 PermissionError。
     tmp = tempfile.mkdtemp(prefix="cgap_")
     plugin_tmp = tempfile.mkdtemp(prefix="cgap_plugin_")
@@ -6307,6 +6747,8 @@ async def main() -> None:
         test_guard()
         test_thought()
         test_dissent()
+        test_keepsake()
+        test_proactive()
         await test_energy_gate(tmp)
     finally:
         for store in list(_OPEN_STORES):

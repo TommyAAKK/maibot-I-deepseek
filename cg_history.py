@@ -201,29 +201,76 @@ def describe_duration(seconds: float) -> str:
 # ── L1：拆出「她没读到的那部分」 ──
 
 
+def in_spans(stamp: float, spans: Iterable[tuple[float, float]]) -> bool:
+    """这个时间戳落不落在任意一段区间里（区间是 ``[start, end]`` 闭区间）。"""
+
+    if stamp <= 0:
+        return False
+    for start, end in spans:
+        if start <= stamp <= end:
+            return True
+    return False
+
+
 def split_window(
     messages: Iterable[dict[str, Any]],
     max_read: int,
     *,
     since_ts: float = 0.0,
+    offline_spans: Iterable[tuple[float, float]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """把合并后的消息拆成「她要读的窗口」和「她读不到的洞」。
 
     ``since_ts`` 是上次抽取的时间：比它更早的消息在上一轮已经处理过了，不该
     再算成本次的洞，否则每轮都会重复报同一段。
+
+    ``offline_spans`` 是**她当时不在线**的时间段（``(start_ts, end_ts)`` 浮点
+    秒，来自宿主的 ``online_time`` 表）。落在这段时间里的消息，无论它在不在
+    最后 ``max_read`` 条之内，都算「她没看见」——而且要从读窗口里**拿走**。
+
+    为什么要多这一个参数：真机实测过一条路径，补抓回来的 20 条全塞进了 30 条
+    的读窗口，于是「洞」是空的、``gap_unread`` 一直是 0 行。她读完那 20 条之后
+    就像从头到尾都在场，而那 20 条里有一半是她关机期间别人说的话。这不是
+    「看得更认真」，是**假装没缺过席**。
+
+    同时判据也必须从读窗口里扣掉这些消息：告诉她「这 10 条你一条都没看到」
+    又把同一批消息塞进她的读窗口，等于自相矛盾——她会两边都知道。
+
+    ``offline_spans`` 为 ``None`` 或空时行为与旧版完全一致（读窗口照旧取最后
+    ``max_read`` 条，洞取窗口之外的部分）。**读不到在线数据时必须走这条旧路**：
+    没有在线数据就无从判断谁没看见，一律当成「她不在」会把所有会话都说成
+    「你错过了一大段」。
     """
 
     ordered = [m for m in messages if isinstance(m, dict)]
     ordered.sort(key=message_stamp)
+    floor = max(0.0, float(since_ts))
+    spans = [(float(s), float(e)) for s, e in (offline_spans or ())]
+
+    # 她当时不在线、而且是上次抽取之后才发生的 → 这段她没看见。
+    missed: list[dict[str, Any]] = []
+    present: list[dict[str, Any]] = []
+    for message in ordered:
+        stamp = message_stamp(message)
+        if spans and stamp > floor and in_spans(stamp, spans):
+            missed.append(message)
+        else:
+            present.append(message)
+
     keep = max(0, int(max_read))
     if keep <= 0:
         window: list[dict[str, Any]] = []
-        rest = ordered
+        rest = present
     else:
-        window = ordered[-keep:]
-        rest = ordered[:-keep]
-    floor = max(0.0, float(since_ts))
-    hole = [m for m in rest if message_stamp(m) > floor]
+        window = present[-keep:]
+        rest = present[:-keep]
+
+    hole = list(missed)
+    hole.extend(m for m in rest if message_stamp(m) > floor)
+    if missed:
+        # 两批混在一起，按时间重排；下游 ``summarize_hole`` 只看首尾和条数，
+        # 顺序错了会把「06:42 到 10:47」说成「10:47 到 06:42」。
+        hole.sort(key=message_stamp)
     return window, hole
 
 
@@ -375,9 +422,9 @@ def render_unread_note(
         where = "" if chat_type == "group" else f"{who}"
         span = describe_span(start, end, now=now)
         if where:
-            line = f"- {where}在{span}之间说了 {count} 条，你不在。"
+            line = f"- {where}在 {span} 之间说了 {count} 条，你不在。"
         else:
-            line = f"- 这个群在{span}之间积了 {count} 条消息，你不在。"
+            line = f"- 这个群在 {span} 之间积了 {count} 条消息，你不在。"
         if used + len(line) > budget:
             break
         used += len(line)

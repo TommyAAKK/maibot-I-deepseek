@@ -99,6 +99,54 @@
               "maximum": 500
             }
           }
+        },
+        "thoughts": {
+          "api": "mem_thoughts",
+          "version": "1",
+          "parameters": {
+            "limit": {
+              "type": "integer",
+              "required": false,
+              "minimum": 1,
+              "maximum": 200
+            },
+            "status": {
+              "type": "string",
+              "required": false,
+              "max_length": 16,
+              "choices": ["", "active", "voiced", "expired"]
+            }
+          }
+        },
+        "keepsakes": {
+          "api": "mem_keepsakes",
+          "version": "1",
+          "parameters": {
+            "limit": {
+              "type": "integer",
+              "required": false,
+              "minimum": 1,
+              "maximum": 200
+            },
+            "status": {
+              "type": "string",
+              "required": false,
+              "max_length": 16,
+              "choices": ["", "kept", "released"]
+            }
+          }
+        },
+        "sparks": {
+          "api": "mem_sparks",
+          "version": "1",
+          "parameters": {
+            "limit": {
+              "type": "integer",
+              "required": false,
+              "minimum": 1,
+              "maximum": 200
+            }
+          }
         }
       },
       "actions": {
@@ -481,6 +529,42 @@
               "type": "string",
               "required": true,
               "max_length": 200
+            }
+          }
+        },
+        "thought_delete": {
+          "api": "mem_thought_delete",
+          "version": "1",
+          "confirmation": "确认把这件事从她心里拿走？拿走之后她就再也不会惦记它了。",
+          "parameters": {
+            "thought_id": {
+              "type": "integer",
+              "required": true,
+              "minimum": 1
+            }
+          }
+        },
+        "keepsake_release": {
+          "api": "mem_keepsake_release",
+          "version": "1",
+          "confirmation": "帮她放掉这一件？放掉之后它还留在这儿（标成「放掉了」），只是不再占她的位置。",
+          "parameters": {
+            "keepsake_id": {
+              "type": "integer",
+              "required": true,
+              "minimum": 1
+            }
+          }
+        },
+        "keepsake_delete": {
+          "api": "mem_keepsake_delete",
+          "version": "1",
+          "confirmation": "确认彻底删掉？删掉之后连「她曾经留过它」这件事都没了。",
+          "parameters": {
+            "keepsake_id": {
+              "type": "integer",
+              "required": true,
+              "minimum": 1
             }
           }
         }

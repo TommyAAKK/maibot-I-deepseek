@@ -95,6 +95,14 @@ class ExtractResult:
     #: 聊天记录里真实存在的一句话，downstream 用它去指回 ``gap_items``。
     #: 拿不到来源的念头在 ``cg_thought`` 里直接丢弃（见那边的说明）。
     thoughts: list[dict[str, Any]] = field(default_factory=list)
+    #: 她**想留着、而且完全没用**的那样东西，同样是搭车得到的。
+    #:
+    #: 每条 ``{"content", "kind"}``，``content`` 是她自己那句话 / 那个画面。
+    #: 和 ``thoughts`` 的区别不是重要程度，而是**有没有用**：念头会改变她下一句
+    #: 话怎么讲，留念什么都不改变，她只是想留着它。所以这里**刻意不要求
+    #: ``source``**——一样没用的东西不需要为它存在的理由提供证据，要求来源
+    #: 就等于在问「它值不值得留」，而那正是这个功能要避开的问法。
+    keepsakes: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _text_of(message: dict[str, Any]) -> str:
@@ -264,6 +272,7 @@ def build_prompt(
     role_hints: Sequence[tuple[str, str]] = (),
     prefs_enabled: bool = True,
     known_prefs: Sequence[str] = (),
+    keepsake_enabled: bool = False,
 ) -> str:
     """构造抽取提示词。
 
@@ -399,6 +408,21 @@ def build_prompt(
             f"{known_prefs_block}"
         )
 
+    keepsake_block = ""
+    if keepsake_enabled:
+        keepsake_block = (
+            "\n9. 再给一个 keepsakes 数组：**你想留着、而且完全没用的东西**。\n"
+            "   - 这是「留念」，不是待办、不是知识点、不是以后用得上的东西。\n"
+            "     对：某个人说错的一个词、一句没头没尾的玩笑、一个你到现在也没想明白的比喻；\n"
+            "     错：「他说下周三要考试」（这是待办）；\n"
+            "     错：「猫喜欢纸箱」（这是知识）；\n"
+            "     错：「他今天心情不好」（这是对别人的判断）。\n"
+            "   - **它的价值就在于没有价值。** 不要给它写理由、不要解释它为什么值得留、\n"
+            "     不要让它对未来有用。你要是能说出它有什么用，那它就不是留念。\n"
+            "   - 最多 1 条，而且**绝大多数轮次应该是空的**——真的一天攒不下几件。\n"
+            "     没遇到就别写，宁可空着。\n"
+        )
+
     return (
         "你在做聊天情境抽取。读下面的聊天记录，只提取「有助于下一轮回复保持连续感」的情境线索。\n"
         "\n"
@@ -432,12 +456,14 @@ def build_prompt(
         f"{mood_block}"
         f"{people_block}"
         f"{prefs_block}"
+        f"{keepsake_block}"
         f"{existing_block}"
         "\n"
         "输出格式：\n"
         '{"items":[{"category":"open_loop","content":"…","salience":0.7,"truth":0.8}],'
         '"resolved":["…"],'
         '"thoughts":[{"content":"我有点不信他真看过","source":"原样摘的一句聊天记录","salience":0.6}],'
+        '"keepsakes":[{"content":"他说「量子缝补」这个词，我到现在也没搞懂","kind":"line"}],'
         '"mood":{"joy":0.6,"anger":0.2,"anxiety":0.1,"sadness":0.1,"interest":0.7,'
         '"calm":0.3,"disgust":0.0,"surprise":0.4,"label":"被逗得开心","reason":"对方连发搞笑视频"},'
         '"people":[{"user_id":"10086","display_name":"小明","relation_role":"",'
@@ -591,6 +617,7 @@ def parse_response(raw: str, *, max_items: int, max_content_chars: int) -> Extra
         "dislikes": _string_list(payload.get("dislikes")),
     }
     result.thoughts = _parse_thoughts(payload.get("thoughts"), max_content_chars=max_content_chars)
+    result.keepsakes = _parse_keepsakes(payload.get("keepsakes"), max_content_chars=max_content_chars)
     result.ok = True
     return result
 
@@ -627,6 +654,37 @@ def _parse_thoughts(raw: Any, *, max_content_chars: int = 60) -> list[dict[str, 
             }
         )
         if len(out) >= 2:
+            break
+    return out
+
+
+def _parse_keepsakes(raw: Any, *, max_content_chars: int = 60) -> list[dict[str, Any]]:
+    """解析模型给的 keepsakes 数组。
+
+    和 ``_parse_thoughts`` 的一处关键不同：**不要求来源**。念头的来源是防止
+    它变成假事实的闸门；留念不参与任何判断，它唯一的作用就是被留着，要求它
+    「证明自己从哪来」等于在问它值不值得留——那正是这个功能要避开的问法。
+
+    但另一端仍然要收紧：太多就不是留念了。上限 1 条，而且内容太长的一律
+    截断（留念应该短，长的是故事不是留念）。
+    """
+
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        content = " ".join(str(entry.get("content") or "").split())
+        if not content:
+            continue
+        if len(content) > max_content_chars * 2:
+            content = content[: max_content_chars * 2]
+        kind = str(entry.get("kind") or "line").strip()
+        if kind not in ("line", "thing"):
+            kind = "line"
+        out.append({"content": content, "kind": kind})
+        if len(out) >= 1:
             break
     return out
 
@@ -716,6 +774,7 @@ async def run_extraction(
     roles: Sequence[dict[str, Any]] | None = None,
     prefs_enabled: bool = True,
     known_prefs: Sequence[str] = (),
+    keepsake_enabled: bool = False,
 ) -> ExtractResult:
     """调用宿主 LLM 做一次抽取。
 
@@ -742,6 +801,7 @@ async def run_extraction(
         role_hints=role_hints,
         prefs_enabled=prefs_enabled,
         known_prefs=known_prefs,
+        keepsake_enabled=keepsake_enabled,
     )
     kwargs: dict[str, Any] = {
         "prompt": prompt,

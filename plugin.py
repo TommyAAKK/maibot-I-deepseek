@@ -108,6 +108,26 @@ from .cg_initiative import (
     evaluate as evaluate_initiative,
     filter_tools,
 )
+from .cg_keepsake import (
+    Keepsake,
+    describe_keepsake,
+    is_full as keepsake_is_full,
+    kept as kept_keepsakes,
+    render_mention_hint,
+    render_overflow_note,
+)
+from .cg_proactive import (
+    KIND_KEEPSAKE,
+    KIND_UNFINISHED,
+    Plan as SparkPlan,
+    Spark,
+    decide as decide_spark,
+    describe_plan as describe_spark_plan,
+    in_quiet_hours,
+    pick_spark,
+    render_intent,
+    spark_from_history,
+)
 from .cg_mood import MoodEngine, render_block as render_mood_block
 from .cg_person import (
     AXIS_KEYS,
@@ -193,6 +213,12 @@ CAPTURE_TIMEOUT_MS = 1000
 #: 在线时段缓存的存活时间。宿主 ``online_time`` 的粒度本来就是 5 分钟，
 #: 每次注入都重新查一遍（30 天约 8600 行）纯属浪费。
 _ONLINE_CACHE_SECONDS = 600.0
+
+#: 「主动」循环的判定间隔（秒）。
+#:
+#: 比在线时段勤，因为它要抓的是「她闲下来了」这个时刻：90 分钟的空闲门槛，
+#: 每 5 分钟看一次最多晚 5 分钟发现，够用；每 10 分钟会让这个判断偏粗。
+_SPARK_TICK_SECONDS = 300.0
 
 _CAPTURE_KW: dict[str, Any] = {
     "name": "capture_message",
@@ -360,6 +386,16 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         # 时限」，而这里要记的是「这一轮重说了几次」，两者寿命不一样。
         # 键存在 = 这一轮在流程里；值 = 已用掉的重生成次数。
         self._dissent_rounds: dict[str, int] = {}
+        # 「主动」后台循环的开关与任务句柄。
+        #
+        # 和 ``_online_loop`` 分开是因为两者节奏完全不同：在线时段 10 分钟刷一次
+        # 就够了，而「她现在闲不闲、要不要开口」得勤一点看。合成一个循环会让
+        # 一次慢查询把另一边也拖住。
+        self._spark_stop = asyncio.Event()
+        self._spark_task: asyncio.Task[Any] | None = None
+        # 每个会话上次「清静下来」的时刻。用来算空闲多久，只放内存——
+        # 重启后从最后一条消息重新算，误差可接受。
+        self._spark_idle_since: dict[str, float] = {}
 
     # ── 配置 ──
 
@@ -409,6 +445,10 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
             log_extract_raw=cfg.debug.log_extract_raw,
             mood=mood,
             gate=self._gate,
+            # 洞判据要用在线区间：补抓回来的那批消息里，落在她离线时段的那几条
+            # 才算「没看见」。走回调读同一份内存缓存，不另查库——两边必须一致，
+            # 否则同一段时间会一边说「她那会儿不在」一边说「她一直在等」。
+            online_windows_getter=lambda: list(self._online_windows),
         )
         await self._tracker.start()
 
@@ -433,7 +473,21 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
         self._online_stop.clear()
         self._online_task = asyncio.create_task(self._online_loop(), name="companion_gap_online")
 
+        # 主动（好奇心）后台循环。默认关，但任务照建——开关在循环里判，
+        # 这样在 WebUI 里打开开关不需要重启插件。
+        self._spark_stop.clear()
+        self._spark_task = asyncio.create_task(self._spark_loop(), name="companion_gap_spark")
+
     async def on_unload(self) -> None:
+        spark_task = self._spark_task
+        self._spark_task = None
+        self._spark_stop.set()
+        if spark_task is not None and not spark_task.done():
+            spark_task.cancel()
+            try:
+                await spark_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - 关闭阶段不抛
+                pass
         online_task = self._online_task
         self._online_task = None
         self._online_stop.set()
@@ -1364,6 +1418,15 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
             if self._dissent_active(session_id):
                 dissent_text = render_dissent_block()
 
+            # 留念满了的提醒。**它只出现在「放不下」的时候**，平时一句都不说：
+            # 一样没用的东西不该每轮都在提示词里占位置，那会让它变回「有用的
+            # 信息」。措辞也刻意不给建议、不列清单（见 cg_keepsake 模块注释）。
+            keepsake_text = ""
+            try:
+                keepsake_text = self._render_keepsake_note(session_id)
+            except Exception as exc:  # noqa: BLE001 - 留念失败不影响回复
+                self._warn(f"留念提醒渲染失败（已跳过）: {exc!r}")
+
             # 统一拼接。顺序即重要性：情绪 → 边界 → 缺席 → 人物 → 记忆
             # → 跨流 → 想起 → 口味 → 念头。原来这里是层层嵌套的三元式，
             # 每加一段就要重写一次，加到最后没人敢动；改成一次性列表拼接。
@@ -1379,6 +1442,7 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
                 recall_text,
                 prefs_text,
                 dissent_text,
+                keepsake_text,
             )
             merged = "\n\n".join(part for part in segments if part)
             if not merged:
@@ -1948,6 +2012,294 @@ class CompanionGapPlugin(MemoryAdminMixin, MaiBotPlugin):
                 continue
             except Exception:  # noqa: BLE001
                 return
+
+    async def _spark_loop(self) -> None:
+        """后台任务：定期看一次「她现在要不要主动开口」。
+
+        **这个循环只做判断和记账，不直接说话。** 真正的开口走
+        ``maisaka.proactive.trigger``，那条路径会 arm 强制触发、绕过频率门控，
+        等于绕过了现有所有「别太吵」的机制——所以它必须由一堆硬闸守着，
+        而不是随手调一次。
+
+        开关关着的时候循环仍然在跑（每轮只判一次 ``enabled`` 就 continue），
+        这样在 WebUI 里打开就能立刻生效，不需要重启插件。
+        """
+
+        while not self._spark_stop.is_set():
+            try:
+                await self._maybe_spark()
+            except Exception as exc:  # noqa: BLE001 - 后台任务绝不能死
+                self._debug(f"主动循环异常（继续）: {exc!r}")
+            try:
+                await asyncio.wait_for(self._spark_stop.wait(), timeout=_SPARK_TICK_SECONDS)
+            except asyncio.TimeoutError:
+                continue
+            except Exception:  # noqa: BLE001
+                return
+
+    async def _maybe_spark(self) -> None:
+        """对所有已知会话判一次要不要主动。"""
+
+        cfg = self.config
+        spark_cfg = getattr(cfg, "proactive", None)
+        if spark_cfg is None or not bool(getattr(spark_cfg, "enabled", False)):
+            return
+        store = self._store
+        tracker = self._tracker
+        if store is None or tracker is None:
+            return
+
+        now = time.time()
+        quiet = in_quiet_hours(
+            now,
+            start=int(getattr(spark_cfg, "quiet_start_hour", 0) or 0),
+            end=int(getattr(spark_cfg, "quiet_end_hour", 8) or 8),
+        )
+        # 精力耗尽时她连话都说不动，不可能好奇。这一条和「不顺着」共用同一个
+        # 判据，因为它问的是同一件事：现在有没有力气开口。
+        mood = self._mood
+        exhausted = bool(mood is not None and not mood.can_initiate())
+
+        for state in self._spark_sessions(store):
+            session_id = str(state.get("session_id") or "").strip()
+            if not session_id:
+                continue
+            try:
+                await self._spark_one(
+                    session_id,
+                    state,
+                    spark_cfg,
+                    now=now,
+                    quiet=quiet,
+                    exhausted=exhausted,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._debug(f"主动判定失败（{session_id}）: {exc!r}")
+
+    def _spark_sessions(self, store: Any) -> list[dict[str, Any]]:
+        """列出可以主动的会话。
+
+        只取「她自己也认识」的会话（``gap_state`` 里有记录、且最近有过互动），
+        不去遍历宿主的所有群——一个从没说过话的群里"忽然想起点什么"是纯打扰。
+        """
+
+        try:
+            states = store.list_states()
+        except Exception as exc:  # noqa: BLE001
+            self._debug(f"读取会话列表失败: {exc!r}")
+            return []
+        now = time.time()
+        out: list[dict[str, Any]] = []
+        for state in states:
+            last = float(state.get("last_seen_ts") or 0.0)
+            if last <= 0.0:
+                continue
+            # 超过 30 天没动静的会话不再主动：那里的人都快忘了她是谁了。
+            if now - last > 30 * 86400.0:
+                continue
+            out.append(state)
+        return out
+
+    async def _spark_one(
+        self,
+        session_id: str,
+        state: dict[str, Any],
+        spark_cfg: Any,
+        *,
+        now: float,
+        quiet: bool,
+        exhausted: bool,
+    ) -> None:
+        """对一个会话判一次，够了就 trigger。"""
+
+        store = self._store
+        if store is None:
+            return
+
+        spark = self._pick_spark(session_id, spark_cfg, state)
+        last_ts = 0.0
+        today = 0
+        try:
+            last_ts = store.last_spark_ts(session_id)
+            today = store.spark_count_today(session_id, now=now)
+        except Exception as exc:  # noqa: BLE001
+            self._debug(f"读取主动记账失败（{session_id}）: {exc!r}")
+
+        # 空闲时长按「这条会话最后一条消息」算，不是按她的思考循环算。
+        idle = max(0.0, now - float(state.get("last_seen_ts") or now))
+        plan = decide_spark(
+            enabled=True,
+            has_material=spark is not None,
+            idle=idle,
+            idle_min_seconds=float(getattr(spark_cfg, "idle_minutes", 90.0) or 90.0) * 60.0,
+            last_spark_ts=last_ts,
+            cooldown_seconds=float(getattr(spark_cfg, "cooldown_hours", 8.0) or 8.0) * 3600.0,
+            today_count=today,
+            daily_limit=int(getattr(spark_cfg, "daily_limit", 1) or 1),
+            exhausted=exhausted,
+            quiet=quiet,
+            boundary=False,
+            now=now,
+        )
+        plan.spark = spark
+
+        log_skips = bool(getattr(spark_cfg, "log_skips", True))
+        if not plan.allow:
+            if log_skips:
+                self._debug(f"{describe_spark_plan(plan)}（{session_id}）")
+                self._record_spark(session_id, spark, plan, status="skipped")
+            return
+
+        intent = render_intent(spark) if spark is not None else ""
+        if not intent:
+            self._debug(f"主动：素材渲染不出 intent，放弃（{session_id}）")
+            return
+        sent = await self._send_spark(session_id, intent, spark)
+        self._record_spark(session_id, spark, plan, status="triggered" if sent else "failed")
+        if sent:
+            self._info(f"{describe_spark_plan(plan)}（{session_id}）")
+
+    def _pick_spark(
+        self,
+        session_id: str,
+        spark_cfg: Any,
+        state: dict[str, Any],
+    ) -> Spark | None:
+        """挑一个由头。三条来源按「最像人忽然想起来」的顺序。"""
+
+        store = self._store
+        if store is None:
+            return None
+        candidates: list[Spark] = []
+
+        # ① 没聊完的事。最接近人「忽然想起来」的感觉，而且不需要新数据。
+        if bool(getattr(spark_cfg, "include_unfinished", True)):
+            try:
+                for row in store.list_by_category(session_id, "open_loop", limit=4):
+                    content = str(row.get("content") or "").strip()
+                    if content:
+                        candidates.append(
+                            Spark(
+                                kind=KIND_UNFINISHED,
+                                content=content[:80],
+                                source=f"item:{row.get('id')}",
+                            )
+                        )
+            except Exception as exc:  # noqa: BLE001
+                self._debug(f"读取未闭合话题失败: {exc!r}")
+
+        # ② 留着的没用东西。「浪费」唯一的出口就在这儿。
+        if bool(getattr(spark_cfg, "include_keepsake", True)):
+            try:
+                rows = store.list_keepsakes(session_id, limit=6, status="kept")
+                for row in rows:
+                    item = Keepsake.from_row(row)
+                    content = str(item.content or "").strip()
+                    if content:
+                        candidates.append(
+                            Spark(
+                                kind=KIND_KEEPSAKE,
+                                content=content[:80],
+                                source=f"keepsake:{item.id}",
+                            )
+                        )
+            except Exception as exc:  # noqa: BLE001
+                self._debug(f"读取留念失败: {exc!r}")
+
+        # ③ 回去翻一段当时不在的聊天。真好奇，且完全不需要外部信息。
+        try:
+            holes = store.list_unread(session_id, limit=2)
+            for hole in holes:
+                rows = store.search_history(
+                    session_id,
+                    since_ts=float(hole.get("start_ts") or 0.0),
+                    until_ts=float(hole.get("end_ts") or 0.0),
+                    limit=40,
+                )
+                if not rows:
+                    continue
+                # 只挑一条：翻整段就变成「读完整个群的聊天记录」，
+                # 那正是之前费很大劲才避开的监控感。
+                picks = spark_from_history(rows, span="", limit=1)
+                candidates.extend(picks)
+        except Exception as exc:  # noqa: BLE001
+            self._debug(f"读取未读历史失败: {exc!r}")
+
+        return pick_spark(candidates)
+
+    async def _send_spark(self, session_id: str, intent: str, spark: Spark | None) -> bool:
+        """走宿主的能力把这个由头交给她。
+
+        失败只记一行——主动开口本来就不该报错到用户面前。
+        """
+
+        maisaka = getattr(self.ctx, "maisaka", None)
+        proactive = getattr(maisaka, "proactive", None)
+        if proactive is None:
+            self._debug("宿主没有 proactive 能力，主动开口不可用")
+            return False
+        try:
+            await proactive.trigger(
+                session_id,
+                intent,
+                reason=f"她自己想起来的（{spark.kind if spark else 'unknown'}）",
+                priority="low",
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"触发主动开口失败（{session_id}）: {exc!r}")
+            return False
+
+    def _record_spark(
+        self,
+        session_id: str,
+        spark: Spark | None,
+        plan: SparkPlan,
+        *,
+        status: str,
+    ) -> None:
+        """记账。**没开口的也要记**，否则出问题时日志里一片空白。"""
+
+        store = self._store
+        if store is None:
+            return
+        try:
+            store.record_spark(
+                session_id,
+                kind=spark.kind if spark is not None else "",
+                content=spark.content if spark is not None else "",
+                source=spark.source if spark is not None else "",
+                status=status,
+                reason=plan.reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._debug(f"记录主动失败: {exc!r}")
+
+    # ── 留念（浪费）────────────────────────────────────────────────
+
+    def _render_keepsake_note(self, session_id: str) -> str:
+        """满了之后提醒她一句「可以挑一件放掉」。
+
+        **只在满的时候说，而且不列出具体是哪几件。** 一旦列出来，模型就会开始
+        按「哪条最没用」排序，而「一样东西有没有用」正是这个功能要拒绝的问法。
+        """
+
+        cfg = self.config
+        keep_cfg = getattr(cfg, "keepsake", None)
+        if keep_cfg is None or not bool(getattr(keep_cfg, "enabled", True)):
+            return ""
+        store = self._store
+        if store is None:
+            return ""
+        try:
+            kept = store.list_keepsakes(session_id, limit=200, status="kept")
+            cap = int(getattr(keep_cfg, "max_items", 12) or 12)
+            if not keepsake_is_full(kept_keepsakes([Keepsake.from_row(r) for r in kept]), cap=cap):
+                return ""
+        except Exception as exc:  # noqa: BLE001
+            self._debug(f"读取留念失败: {exc!r}")
+            return ""
+        return render_overflow_note(len(kept), cap=cap)
 
     def _render_presence_shift(self, presence: Presence, chat_type: str, cfg: Any) -> str:
         """渲染「那段时间我不在 / 有待补消息」的提示。

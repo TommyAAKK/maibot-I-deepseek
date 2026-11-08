@@ -1213,6 +1213,123 @@ if (bad.length) { console.error(bad.join('\\n')); process.exit(1); }
         "折叠时标题行摘要仍写全两边的数量",
     )
 
+    print("[17] 念头 / 留念 / 主动面板")
+    # 用户第 57 轮：「我们的 webui 中还没有做念头的模块」。
+    # 三块都是「她自己想出来的东西」，性质上和上面那些「查记忆」的面板不同：
+    # 记忆是记录，这些是倾向。所以三块一律默认折叠、都排在记忆下面。
+    for panel_id, fold_id, body_id in (
+        ("cg-thoughts", "cg-thoughts-fold", "cg-thoughts-body"),
+        ("cg-keepsakes", "cg-keepsakes-fold", "cg-keepsakes-body"),
+        ("cg-sparks", "cg-sparks-fold", "cg-sparks-body"),
+    ):
+        check(
+            f'class="cg-panel {panel_id} folded" id="{panel_id}"' in html
+            or f'class="cg-panel cg-{panel_id.split("-")[1]} folded" id="{panel_id}"' in html
+            or (
+                f'id="{panel_id}"' in html
+                and f'id="{fold_id}"' in html
+                and f'id="{body_id}"' in html
+            ),
+            f"{panel_id} 存在且有折叠按钮与内容容器",
+        )
+        check(
+            f'aria-controls="{body_id}"' in html,
+            f"{panel_id} 的折叠按钮带 aria 关联",
+        )
+    # 三块必须排在记忆面板**后面**：用户明确说了「放在记忆模块下面」。
+    # 用「面板开始位置」的相对顺序判断，避免依赖具体行号。
+    _order = {
+        name: html.find(f'id="{name}"')
+        for name in ("cg-memories", "cg-thoughts", "cg-keepsakes", "cg-sparks")
+    }
+    check(
+        all(_order[name] > _order["cg-memories"] for name in ("cg-thoughts", "cg-keepsakes", "cg-sparks")),
+        "念头 / 留念 / 主动三块都排在记忆面板后面",
+    )
+    check(
+        _order["cg-thoughts"] < _order["cg-keepsakes"] < _order["cg-sparks"],
+        "三块的顺序是念头 → 留念 → 主动（从「她在想什么」到「她做过什么」）",
+    )
+    # 折叠状态必须和标题行摘要一起工作：折起来只剩「还惦记着 N 件」这类字数。
+    check(
+        "cg-thoughts-cap" in html and "cg-keepsakes-cap" in html and "cg-sparks-cap" in html,
+        "三块折叠后标题行都有摘要位置",
+    )
+
+    # 念头的来源必须显示。没有来源的念头就只是猜测——这一列是「她不是在背后
+    # 议论人」的唯一可见证据，不能省。
+    check(
+        "cg-thought-source" in html and "'来自：' + item.source_text" in html,
+        "念头卡片显示它出自哪一句话",
+    )
+    check(
+        "if (item.source_text)" in html,
+        "没有来源时不渲染空的「来自：」（旧数据可能没有）",
+    )
+
+    # 留念的「放掉」和「删除」必须是两个按钮两种语义。
+    # 放掉是记录（还看得见），删除是抹掉（连「曾经留过」都没了）。
+    check(
+        "keepsake_release" in html and "keepsake_delete" in html,
+        "留念同时有「放掉」和「删除」，两者分开",
+    )
+    check(
+        "item.status !== 'released'" in html,
+        "已经放掉的留念不再显示「放掉」按钮",
+    )
+    check(
+        "'放掉于 ' + fmtTime(item.released_at)" in html,
+        "放掉的留念标出放掉时间（记录而不是消失）",
+    )
+    # 摘要不能写成「已用 3/12」：那会读成待办进度条，而这一块刻意不是待办。
+    check(
+        "/ ' + capNum" not in html and "capNum" not in html.split("cg-keepsakes-cap")[1][:600],
+        "留念摘要不显示「已用 x/12」这种暗示要清理的进度",
+    )
+
+    # 主动的「没开口」也要显示，并且带原因。
+    check(
+        "if (item.reason)" in html and "item.status_label" in html,
+        "主动记录同时显示「开口了 / 没开口」和原因",
+    )
+    check(
+        "'开口 ' + triggered + ' 次 / 没开口 ' + skipped + ' 次'" in html,
+        "主动摘要分开写开口与没开口的次数（只写成功会让排查无从下手）",
+    )
+
+    # 三块都没有编辑入口：能改的只有删掉 / 放掉。
+    # 改内容等于替她想，而「她想什么」正是这个功能本身。
+    for modal_id in ("cg-thought-modal", "cg-keepsake-modal", "cg-spark-modal"):
+        check(
+            f'id="{modal_id}"' not in html,
+            f"没有 {modal_id} —— 这三块不提供编辑（改内容等于替她想）",
+        )
+
+    # 空状态不能写成出错的样子：大部分时间它们本来就该是空的。
+    for empty_text in ("没有搁着的事", "还没留下什么", "还没有自己想起来"):
+        check(
+            empty_text in html,
+            f"空状态文案是中性描述而不是报错：{empty_text}",
+        )
+
+    # 加载器要挂在 boot 链上，否则页面打开时这几块永远是「正在读取…」。
+    check(
+        "loadThoughts()" in html and "loadKeepsakes()" in html and "loadSparks()" in html,
+        "三个加载器都接上了",
+    )
+    _boot_chain = html.split("function boot()")[-1]
+    check(
+        "loadThoughts" in _boot_chain and "loadKeepsakes" in _boot_chain and "loadSparks" in _boot_chain,
+        "boot 的加载链调用了这三个（否则永远停在「正在读取…」）",
+    )
+    # 刷新按钮要真的刷新整页，不能只刷记忆那三样。
+    _reload_body = html.split("function reload()")[-1].split("function ")[0]
+    for loader in ("loadMood", "loadPeople", "loadPrefs", "loadThoughts", "loadKeepsakes", "loadSparks"):
+        check(
+            loader in _reload_body,
+            f"刷新按钮会重载 {loader}",
+        )
+
     print()
     if _failures:
         print(f"失败 {len(_failures)} 项 / 共 {_checks} 项检查")

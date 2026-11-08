@@ -42,6 +42,12 @@ except Exception:  # pragma: no cover - 仅用于脱离 Runner 的本地导入/�
 
         return decorator
 
+from .cg_keepsake import (
+    KIND_LABELS as KEEPSAKE_KIND_LABELS,
+    MAX_ITEMS as KEEPSAKE_MAX_ITEMS,
+    STATUS_KEPT,
+    STATUS_RELEASED,
+)
 from .cg_prefs import (
     KINDS,
     KIND_LABELS,
@@ -52,7 +58,9 @@ from .cg_prefs import (
     normalize_topic,
     prefs_key,
 )
+from .cg_proactive import KIND_LABELS as SPARK_KIND_LABELS
 from .cg_store import CATEGORIES, CATEGORY_LABELS, STATUSES, STATUS_LABELS
+from .cg_thought import KIND_DISSENT, STATUS_ACTIVE, STATUS_VOICED
 
 #: 单页最多返回多少条。太大容易撞宿主的 512 KiB 返回值上限。
 MAX_PAGE_SIZE = 200
@@ -1195,3 +1203,209 @@ class MemoryAdminMixin:
             return {"ok": True, "deleted": key}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"删除喜好失败：{exc}"}
+
+    # ── 念头 / 留念 / 主动 ────────────────────────────────────────
+    #
+    # 这三块都是**跨会话**的。记忆、人物、喜好按会话切开还能用，但「她现在
+    # 心里惦记着什么」按会话切就得一个个点过去才拼得全——那不是用户想看的。
+    #
+    # 页面上的位置（用户第 57 轮指定）：念头放记忆下面，默认折叠。留念和
+    # 主动都是「她想出来的东西」，跟着念头一起排在记忆之后。
+    #
+    # ⚠️ 这一整块**不进任何注入路径**。它是给人看的，不是给模型看的——给模型
+    # 看的东西在 cg_thought / cg_keepsake / cg_proactive 里，各有各的入口。
+
+    def _webui_session_label(self, store, session_ids) -> dict[str, str]:
+        """会话 id → 人话名字（「某某群」/ 对方昵称 / 短码）。"""
+
+        return store.session_labels([s for s in session_ids if s])
+
+    def _thought_payload(self, row: dict[str, Any], labels: dict[str, str]) -> dict[str, Any]:
+        status = str(row.get("status") or STATUS_ACTIVE)
+        return {
+            "id": int(row.get("id") or 0),
+            "session_id": str(row.get("session_id") or ""),
+            "session_label": labels.get(str(row.get("session_id") or ""), ""),
+            "kind": str(row.get("kind") or KIND_DISSENT),
+            "content": str(row.get("content") or ""),
+            "source_kind": str(row.get("source_kind") or ""),
+            "source_text": str(row.get("source_text") or ""),
+            "salience": round(float(row.get("salience") or 0.0), 3),
+            "status": status,
+            "status_label": "还惦记着" if status == STATUS_ACTIVE else (
+                "说出口了" if status == STATUS_VOICED else "忘了"
+            ),
+            "awaken_count": int(row.get("awaken_count") or 0),
+            "last_awaken_ts": float(row.get("last_awaken_ts") or 0.0),
+            "voiced_at": float(row.get("voiced_at") or 0.0),
+            "expires_at": float(row.get("expires_at") or 0.0),
+            "created_at": float(row.get("created_at") or 0.0),
+        }
+
+    @API("mem_thoughts", description="列出 Bot 心里惦记着的事（跨会话）", version="1")
+    async def mem_thoughts(self, limit: int = 60, status: str = "") -> dict[str, Any]:
+        """念头列表。
+
+        ``status=""`` 只看还活着的（``active`` 且没过期）——这是默认视角，
+        因为「忘了的」和「说出口的」都只是历史，翻它们要看专门的状态筛选。
+        """
+
+        try:
+            store = self._webui_store()
+            size = max(1, min(MAX_PAGE_SIZE, int(limit)))
+            wanted = str(status or "").strip()
+            if wanted and wanted not in ("active", "voiced", "expired"):
+                return {"ok": False, "error": f"未知状态：{wanted}"}
+            rows = store.list_all_thoughts(limit=size, status=wanted)
+            labels = self._webui_session_label(store, [r.get("session_id") for r in rows])
+            return {
+                "ok": True,
+                "thoughts": [self._thought_payload(row, labels) for row in rows],
+                "total": len(rows),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"读取念头失败：{exc}"}
+
+    @API("mem_thought_delete", description="删掉一条念头", version="1")
+    async def mem_thought_delete(self, thought_id: int) -> dict[str, Any]:
+        """删掉。
+
+        注意这里和「说出口」不一样：说出口只是记一笔（``voiced``），「我把它
+        从她心里拿走」才是删。两者都可能被用户点到，所以按钮文案要分开。
+        """
+
+        try:
+            store = self._webui_store()
+            tid = int(thought_id or 0)
+            if tid <= 0:
+                return {"ok": False, "error": "缺少 thought_id"}
+            cursor = store.conn.execute("DELETE FROM gap_thoughts WHERE id = ?", (tid,))
+            store.conn.commit()
+            if not int(cursor.rowcount):
+                return {"ok": False, "error": f"没找到念头 {tid}"}
+            return {"ok": True, "deleted": tid}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"删除念头失败：{exc}"}
+
+    def _keepsake_payload(self, row: dict[str, Any], labels: dict[str, str]) -> dict[str, Any]:
+        kind = str(row.get("kind") or "line")
+        status = str(row.get("status") or STATUS_KEPT)
+        return {
+            "id": int(row.get("id") or 0),
+            "session_id": str(row.get("session_id") or ""),
+            "session_label": labels.get(str(row.get("session_id") or ""), ""),
+            "kind": kind,
+            "kind_label": KEEPSAKE_KIND_LABELS.get(kind, kind),
+            "content": str(row.get("content") or ""),
+            "source_text": str(row.get("source_text") or ""),
+            "status": status,
+            "status_label": "还留着" if status == STATUS_KEPT else "放掉了",
+            "look_count": int(row.get("look_count") or 0),
+            "last_looked_ts": float(row.get("last_looked_ts") or 0.0),
+            "released_at": float(row.get("released_at") or 0.0),
+            "created_at": float(row.get("created_at") or 0.0),
+        }
+
+    @API("mem_keepsakes", description="列出 Bot 留着的没用的东西（跨会话）", version="1")
+    async def mem_keepsakes(self, limit: int = 200, status: str = "kept") -> dict[str, Any]:
+        """留念列表。默认只看还留着的。
+
+        页面上的措辞要克制：这是「她没舍得扔的东西」，不是「收藏夹」。所以
+        不放数量进度条、不显示「已用 3/12」这种暗示要清理的东西。
+        """
+
+        try:
+            store = self._webui_store()
+            size = max(1, min(MAX_PAGE_SIZE, int(limit)))
+            wanted = str(status or "").strip()
+            if wanted and wanted not in (STATUS_KEPT, STATUS_RELEASED):
+                return {"ok": False, "error": f"未知状态：{wanted}"}
+            rows = store.list_all_keepsakes(limit=size, status=wanted)
+            labels = self._webui_session_label(store, [r.get("session_id") for r in rows])
+            totals = store.keepsake_totals()
+            return {
+                "ok": True,
+                "keepsakes": [self._keepsake_payload(row, labels) for row in rows],
+                "total": len(rows),
+                "kept": totals["kept"],
+                "released": totals["released"],
+                "cap": KEEPSAKE_MAX_ITEMS,
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"读取留念失败：{exc}"}
+
+    @API("mem_keepsake_release", description="放掉一条留念（记录，不删除）", version="1")
+    async def mem_keepsake_release(self, keepsake_id: int) -> dict[str, Any]:
+        """「放掉」而不是「删除」。
+
+        放掉之后它还留在列表里（``released``），因为「扔掉」和「从没存在过」
+        是两件事。真要抹掉得用 ``mem_keepsake_delete``。
+        """
+
+        try:
+            store = self._webui_store()
+            kid = int(keepsake_id or 0)
+            if kid <= 0:
+                return {"ok": False, "error": "缺少 keepsake_id"}
+            if not store.release_keepsake(kid):
+                return {"ok": False, "error": "这条已经放掉了"}
+            return {"ok": True, "released": kid}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"放掉留念失败：{exc}"}
+
+    @API("mem_keepsake_delete", description="彻底删掉一条留念", version="1")
+    async def mem_keepsake_delete(self, keepsake_id: int) -> dict[str, Any]:
+        try:
+            store = self._webui_store()
+            kid = int(keepsake_id or 0)
+            if kid <= 0:
+                return {"ok": False, "error": "缺少 keepsake_id"}
+            if not store.delete_keepsake(kid):
+                return {"ok": False, "error": f"没找到留念 {kid}"}
+            return {"ok": True, "deleted": kid}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"删除留念失败：{exc}"}
+
+    @API("mem_sparks", description="列出 Bot 主动开口的记账（含没开口的原因）", version="1")
+    async def mem_sparks(self, limit: int = 60) -> dict[str, Any]:
+        """主动记账。
+
+        **跳过的也列出来。** 这一块最大的用处不是「她说了什么」，而是「她
+        为什么没说」——只显示成功的话，出问题时这一页永远是空的，看不出是
+        没触发还是被挡住了。
+        """
+
+        try:
+            store = self._webui_store()
+            size = max(1, min(MAX_PAGE_SIZE, int(limit)))
+            rows = store.list_all_sparks(limit=size)
+            labels = self._webui_session_label(store, [r.get("session_id") for r in rows])
+            totals = store.spark_totals()
+            payload = []
+            for row in rows:
+                kind = str(row.get("kind") or "")
+                status = str(row.get("status") or "skipped")
+                payload.append(
+                    {
+                        "id": int(row.get("id") or 0),
+                        "session_id": str(row.get("session_id") or ""),
+                        "session_label": labels.get(str(row.get("session_id") or ""), ""),
+                        "kind": kind,
+                        "kind_label": SPARK_KIND_LABELS.get(kind, kind),
+                        "content": str(row.get("content") or ""),
+                        "status": status,
+                        "status_label": "开口了" if status == "triggered" else "没开口",
+                        "reason": str(row.get("reason") or ""),
+                        "triggered_at": float(row.get("triggered_at") or 0.0),
+                        "created_at": float(row.get("created_at") or 0.0),
+                    }
+                )
+            return {
+                "ok": True,
+                "sparks": payload,
+                "total": len(payload),
+                "triggered": totals["triggered"],
+                "skipped": totals["skipped"],
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"读取主动记录失败：{exc}"}
